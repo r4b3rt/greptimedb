@@ -14,13 +14,17 @@
 
 use std::hash::{Hash, Hasher};
 
-use store_api::logstore::entry::{Entry, Id};
-use store_api::logstore::namespace::Namespace;
+use store_api::logstore::entry::{Entry, Id as EntryId};
+use store_api::logstore::namespace::{Id as NamespaceId, Namespace};
 
 use crate::error::Error;
 use crate::raft_engine::protos::logstore::{EntryImpl, NamespaceImpl};
 
+mod backend;
 pub mod log_store;
+
+pub use backend::RaftEngineBackend;
+pub use raft_engine::Config;
 
 pub mod protos {
     include!(concat!(env!("OUT_DIR"), concat!("/", "protos/", "mod.rs")));
@@ -36,8 +40,9 @@ impl EntryImpl {
         }
     }
 }
+
 impl NamespaceImpl {
-    pub fn with_id(id: Id) -> Self {
+    pub fn with_id(id: NamespaceId) -> Self {
         Self {
             id,
             ..Default::default()
@@ -45,15 +50,17 @@ impl NamespaceImpl {
     }
 }
 
-#[allow(clippy::derive_hash_xor_eq)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 impl Hash for NamespaceImpl {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
 
+impl Eq for NamespaceImpl {}
+
 impl Namespace for NamespaceImpl {
-    fn id(&self) -> store_api::logstore::namespace::Id {
+    fn id(&self) -> NamespaceId {
         self.id
     }
 }
@@ -66,7 +73,7 @@ impl Entry for EntryImpl {
         self.data.as_slice()
     }
 
-    fn id(&self) -> Id {
+    fn id(&self) -> EntryId {
         self.id
     }
 

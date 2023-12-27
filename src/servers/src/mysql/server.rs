@@ -17,8 +17,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use auth::UserProviderRef;
 use common_runtime::Runtime;
-use common_telemetry::logging::{error, info};
+use common_telemetry::error;
+use common_telemetry::logging::{info, warn};
 use futures::StreamExt;
 use opensrv_mysql::{
     plain_run_with_options, secure_run_with_options, AsyncMysqlIntermediary, IntermediaryOptions,
@@ -28,7 +30,6 @@ use tokio::io::BufWriter;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::ServerConfig;
 
-use crate::auth::UserProviderRef;
 use crate::error::{Error, Result};
 use crate::mysql::handler::MysqlInstanceShim;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
@@ -134,12 +135,15 @@ impl MysqlServer {
 
             async move {
                 match tcp_stream {
-                    Err(error) => error!("Broken pipe: {}", error), // IoError doesn't impl ErrorExt.
+                    Err(error) => warn!("Broken pipe: {}", error), // IoError doesn't impl ErrorExt.
                     Ok(io_stream) => {
+                        if let Err(e) = io_stream.set_nodelay(true) {
+                            error!(e; "Failed to set TCP nodelay");
+                        }
                         if let Err(error) =
                             Self::handle(io_stream, io_runtime, spawn_ref, spawn_config).await
                         {
-                            error!(error; "Unexpected error when handling TcpStream");
+                            warn!("Unexpected error when handling TcpStream {}", error);
                         };
                     }
                 };
@@ -154,13 +158,14 @@ impl MysqlServer {
         spawn_config: Arc<MysqlSpawnConfig>,
     ) -> Result<()> {
         info!("MySQL connection coming from: {}", stream.peer_addr()?);
-        io_runtime.spawn(async move {
-            // TODO(LFC): Use `output_stream` to write large MySQL ResultSet to client.
+        let _handle = io_runtime.spawn(async move {
+            crate::metrics::METRIC_MYSQL_CONNECTIONS.inc();
             if let Err(e)  = Self::do_handle(stream, spawn_ref, spawn_config).await {
                 // TODO(LFC): Write this error to client as well, in MySQL text protocol.
                 // Looks like we have to expose opensrv-mysql's `PacketWriter`?
-                error!(e; "Internal error occurred during query exec, server actively close the channel to let client try next time.")
+                warn!(e; "Internal error occurred during query exec, server actively close the channel to let client try next time")
             }
+            crate::metrics::METRIC_MYSQL_CONNECTIONS.dec();
         });
 
         Ok(())
@@ -200,6 +205,8 @@ impl MysqlServer {
     }
 }
 
+pub const MYSQL_SERVER: &str = "MYSQL_SERVER";
+
 #[async_trait]
 impl Server for MysqlServer {
     async fn shutdown(&self) -> Result<()> {
@@ -210,8 +217,12 @@ impl Server for MysqlServer {
         let (stream, addr) = self.base_server.bind(listening).await?;
         let io_runtime = self.base_server.io_runtime();
 
-        let join_handle = tokio::spawn(self.accept(io_runtime, stream));
+        let join_handle = common_runtime::spawn_read(self.accept(io_runtime, stream));
         self.base_server.start_with(join_handle).await?;
         Ok(addr)
+    }
+
+    fn name(&self) -> &str {
+        MYSQL_SERVER
     }
 }

@@ -30,13 +30,17 @@ mod boolean;
 mod constant;
 mod date;
 mod datetime;
+mod decimal;
+mod duration;
 mod eq;
 mod helper;
+mod interval;
 mod list;
 mod null;
-mod operations;
+pub(crate) mod operations;
 mod primitive;
 mod string;
+mod time;
 mod timestamp;
 mod validity;
 
@@ -45,7 +49,17 @@ pub use boolean::{BooleanVector, BooleanVectorBuilder};
 pub use constant::ConstantVector;
 pub use date::{DateVector, DateVectorBuilder};
 pub use datetime::{DateTimeVector, DateTimeVectorBuilder};
+pub use decimal::{Decimal128Vector, Decimal128VectorBuilder};
+pub use duration::{
+    DurationMicrosecondVector, DurationMicrosecondVectorBuilder, DurationMillisecondVector,
+    DurationMillisecondVectorBuilder, DurationNanosecondVector, DurationNanosecondVectorBuilder,
+    DurationSecondVector, DurationSecondVectorBuilder,
+};
 pub use helper::Helper;
+pub use interval::{
+    IntervalDayTimeVector, IntervalDayTimeVectorBuilder, IntervalMonthDayNanoVector,
+    IntervalMonthDayNanoVectorBuilder, IntervalYearMonthVector, IntervalYearMonthVectorBuilder,
+};
 pub use list::{ListIter, ListVector, ListVectorBuilder};
 pub use null::{NullVector, NullVectorBuilder};
 pub use primitive::{
@@ -56,6 +70,11 @@ pub use primitive::{
     UInt64VectorBuilder, UInt8Vector, UInt8VectorBuilder,
 };
 pub use string::{StringVector, StringVectorBuilder};
+pub use time::{
+    TimeMicrosecondVector, TimeMicrosecondVectorBuilder, TimeMillisecondVector,
+    TimeMillisecondVectorBuilder, TimeNanosecondVector, TimeNanosecondVectorBuilder,
+    TimeSecondVector, TimeSecondVectorBuilder,
+};
 pub use timestamp::{
     TimestampMicrosecondVector, TimestampMicrosecondVectorBuilder, TimestampMillisecondVector,
     TimestampMillisecondVectorBuilder, TimestampNanosecondVector, TimestampNanosecondVectorBuilder,
@@ -172,10 +191,28 @@ pub trait MutableVector: Send + Sync {
     /// Convert `self` to an (immutable) [VectorRef] and reset `self`.
     fn to_vector(&mut self) -> VectorRef;
 
+    /// Convert `self` to an (immutable) [VectorRef] and without resetting `self`.
+    fn to_vector_cloned(&self) -> VectorRef;
+
+    /// Try to push value ref to this mutable vector.
+    fn try_push_value_ref(&mut self, value: ValueRef) -> Result<()>;
+
     /// Push value ref to this mutable vector.
     ///
-    /// Returns error if data types mismatch.
-    fn push_value_ref(&mut self, value: ValueRef) -> Result<()>;
+    /// # Panics
+    /// Panics if error if data types mismatch.
+    fn push_value_ref(&mut self, value: ValueRef) {
+        self.try_push_value_ref(value).unwrap_or_else(|_| {
+            panic!(
+                "expecting pushing value of datatype {:?}, actual {:?}",
+                self.data_type(),
+                value
+            );
+        });
+    }
+
+    // Push null to this mutable vector.
+    fn push_null(&mut self);
 
     /// Extend this mutable vector by slice of `vector`.
     ///
@@ -195,18 +232,16 @@ macro_rules! impl_try_from_arrow_array_for_vector {
             ) -> crate::error::Result<$Vector> {
                 use snafu::OptionExt;
 
-                let data = array
+                let arrow_array = array
                     .as_ref()
                     .as_any()
                     .downcast_ref::<$Array>()
                     .with_context(|| crate::error::ConversionSnafu {
                         from: std::format!("{:?}", array.as_ref().data_type()),
                     })?
-                    .data()
                     .clone();
 
-                let concrete_array = $Array::from(data);
-                Ok($Vector::from(concrete_array))
+                Ok($Vector::from(arrow_array))
             }
         }
     };
@@ -214,7 +249,7 @@ macro_rules! impl_try_from_arrow_array_for_vector {
 
 macro_rules! impl_validity_for_vector {
     ($array: expr) => {
-        Validity::from_array_data($array.data())
+        Validity::from_array_data($array.to_data())
     };
 }
 
@@ -270,10 +305,12 @@ pub(crate) use {
 #[cfg(test)]
 pub mod tests {
     use arrow::array::{Array, Int32Array, UInt8Array};
+    use paste::paste;
     use serde_json;
 
     use super::*;
     use crate::data_type::DataType;
+    use crate::prelude::ScalarVectorBuilder;
     use crate::types::{Int32Type, LogicalPrimitiveType};
     use crate::vectors::helper::Helper;
 
@@ -305,5 +342,102 @@ pub mod tests {
             .serialize_to_json()
             .unwrap();
         assert_eq!("[1,2,3]", serde_json::to_string(&json_value).unwrap());
+    }
+
+    #[test]
+    fn test_mutable_vector_data_type() {
+        macro_rules! mutable_primitive_data_type_eq_with_lower {
+            ($($type: ident),*) => {
+                $(
+                    paste! {
+                        let mutable_vector = [<$type VectorBuilder>]::with_capacity(1024);
+                        assert_eq!(mutable_vector.data_type(), ConcreteDataType::[<$type:lower _datatype>]());
+                    }
+                )*
+            };
+        }
+
+        macro_rules! mutable_time_data_type_eq_with_snake {
+            ($($type: ident),*) => {
+                $(
+                    paste! {
+                        let mutable_vector = [<$type VectorBuilder>]::with_capacity(1024);
+                        assert_eq!(mutable_vector.data_type(), ConcreteDataType::[<$type:snake _datatype>]());
+                    }
+                )*
+            };
+        }
+        // Test Primitive types
+        mutable_primitive_data_type_eq_with_lower!(
+            Boolean, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64,
+            Date, DateTime, Binary, String
+        );
+
+        // Test types about time
+        mutable_time_data_type_eq_with_snake!(
+            TimeSecond,
+            TimeMillisecond,
+            TimeMicrosecond,
+            TimeNanosecond,
+            TimestampSecond,
+            TimestampMillisecond,
+            TimestampMicrosecond,
+            TimestampNanosecond,
+            DurationSecond,
+            DurationMillisecond,
+            DurationMicrosecond,
+            DurationNanosecond,
+            IntervalYearMonth,
+            IntervalDayTime,
+            IntervalMonthDayNano
+        );
+
+        // Null type
+        let builder = NullVectorBuilder::default();
+        assert_eq!(builder.data_type(), ConcreteDataType::null_datatype());
+
+        // Decimal128 type
+        let builder = Decimal128VectorBuilder::with_capacity(1024);
+        assert_eq!(
+            builder.data_type(),
+            ConcreteDataType::decimal128_datatype(38, 10)
+        );
+
+        let builder = Decimal128VectorBuilder::with_capacity(1024)
+            .with_precision_and_scale(3, 2)
+            .unwrap();
+        assert_eq!(
+            builder.data_type(),
+            ConcreteDataType::decimal128_datatype(3, 2)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Must use ListVectorBuilder::with_type_capacity()")]
+    fn test_mutable_vector_list_data_type() {
+        // List type
+        let builder =
+            ListVectorBuilder::with_type_capacity(ConcreteDataType::int32_datatype(), 1024);
+        assert_eq!(
+            builder.data_type(),
+            ConcreteDataType::list_datatype(ConcreteDataType::int32_datatype())
+        );
+
+        // Panic with_capacity
+        let _ = ListVectorBuilder::with_capacity(1024);
+    }
+
+    #[test]
+    fn test_mutable_vector_to_vector_cloned() {
+        // create a string vector builder
+        let mut builder = ConcreteDataType::string_datatype().create_mutable_vector(1024);
+        builder.push_value_ref(ValueRef::String("hello"));
+        builder.push_value_ref(ValueRef::String("world"));
+        builder.push_value_ref(ValueRef::String("!"));
+
+        // use MutableVector trait to_vector_cloned won't reset builder
+        let vector = builder.to_vector_cloned();
+        assert_eq!(vector.len(), 3);
+        assert_eq!(builder.len(), 3);
     }
 }

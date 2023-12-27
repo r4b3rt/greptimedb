@@ -13,8 +13,10 @@
 // limitations under the License.
 
 mod alter;
+pub mod delete;
 pub mod error;
 pub mod insert;
+pub mod util;
 
-pub use alter::{alter_expr_to_request, create_expr_to_request, create_table_schema};
-pub use insert::{build_create_expr_from_insertion, column_to_vector, find_new_columns};
+pub use alter::{alter_expr_to_request, create_table_schema};
+pub use insert::{build_create_expr_from_insertion, find_new_columns};

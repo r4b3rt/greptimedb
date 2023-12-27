@@ -18,6 +18,8 @@ use std::task::{Context, Poll};
 use arrow_flight::FlightData;
 use common_grpc::flight::{FlightEncoder, FlightMessage};
 use common_recordbatch::SendableRecordBatchStream;
+use common_telemetry::tracing::info_span;
+use common_telemetry::tracing_context::{FutureExt, TracingContext};
 use common_telemetry::warn;
 use futures::channel::mpsc;
 use futures::channel::mpsc::Sender;
@@ -30,7 +32,7 @@ use super::TonicResult;
 use crate::error;
 
 #[pin_project(PinnedDrop)]
-pub(super) struct FlightRecordBatchStream {
+pub struct FlightRecordBatchStream {
     #[pin]
     rx: mpsc::Receiver<Result<FlightMessage, tonic::Status>>,
     join_handle: JoinHandle<()>,
@@ -39,12 +41,13 @@ pub(super) struct FlightRecordBatchStream {
 }
 
 impl FlightRecordBatchStream {
-    pub(super) fn new(recordbatches: SendableRecordBatchStream) -> Self {
+    pub fn new(recordbatches: SendableRecordBatchStream, tracing_context: TracingContext) -> Self {
         let (tx, rx) = mpsc::channel::<TonicResult<FlightMessage>>(1);
-        let join_handle =
-            common_runtime::spawn_read(
-                async move { Self::flight_data_stream(recordbatches, tx).await },
-            );
+        let join_handle = common_runtime::spawn_read(async move {
+            Self::flight_data_stream(recordbatches, tx)
+                .trace(tracing_context.attach(info_span!("flight_data_stream")))
+                .await
+        });
         Self {
             rx,
             join_handle,
@@ -140,13 +143,13 @@ mod test {
             false,
         )]));
 
-        let v: VectorRef = Arc::new(Int32Vector::from_slice(&[1, 2]));
+        let v: VectorRef = Arc::new(Int32Vector::from_slice([1, 2]));
         let recordbatch = RecordBatch::new(schema.clone(), vec![v]).unwrap();
 
         let recordbatches = RecordBatches::try_new(schema.clone(), vec![recordbatch.clone()])
             .unwrap()
             .as_stream();
-        let mut stream = FlightRecordBatchStream::new(recordbatches);
+        let mut stream = FlightRecordBatchStream::new(recordbatches, TracingContext::default());
 
         let mut raw_data = Vec::with_capacity(2);
         raw_data.push(stream.next().await.unwrap().unwrap());

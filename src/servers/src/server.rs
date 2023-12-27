@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -28,8 +29,18 @@ use crate::error::{self, Result};
 
 pub(crate) type AbortableStream = Abortable<TcpListenerStream>;
 
+pub type ServerHandlers = HashMap<String, ServerHandler>;
+
+pub type ServerHandler = (Box<dyn Server>, SocketAddr);
+
+pub async fn start_server(server_handler: &ServerHandler) -> Result<Option<SocketAddr>> {
+    let (server, addr) = server_handler;
+    info!("Starting {} at {}", server.name(), addr);
+    server.start(*addr).await.map(Some)
+}
+
 #[async_trait]
-pub trait Server: Send {
+pub trait Server: Send + Sync {
     /// Shutdown the server gracefully.
     async fn shutdown(&self) -> Result<()>;
 
@@ -37,6 +48,8 @@ pub trait Server: Send {
     ///
     /// Caller should ensure `start()` is only invoked once.
     async fn start(&self, listening: SocketAddr) -> Result<SocketAddr>;
+
+    fn name(&self) -> &str;
 }
 
 struct AcceptTask {
@@ -110,7 +123,7 @@ impl AcceptTask {
                 err_msg: format!("{name} server has been started."),
             }
         );
-        self.join_handle.get_or_insert(join_handle);
+        let _handle = self.join_handle.get_or_insert(join_handle);
         Ok(())
     }
 }

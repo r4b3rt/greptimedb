@@ -21,20 +21,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, PrimitiveArray, StringArray, TimestampNanosecondArray};
+use arrow::array::{ArrayRef, PrimitiveArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
 use client::api::v1::column::Values;
-use client::api::v1::{Column, ColumnDataType, ColumnDef, CreateTableExpr, InsertRequest, TableId};
-use client::{Client, Database};
+use client::api::v1::{
+    Column, ColumnDataType, ColumnDef, CreateTableExpr, InsertRequest, InsertRequests, SemanticType,
+};
+use client::{Client, Database, Output, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use futures_util::TryStreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::task::JoinSet;
 
 const CATALOG_NAME: &str = "greptime";
 const SCHEMA_NAME: &str = "public";
-const TABLE_NAME: &str = "nyc_taxi";
 
 #[derive(Parser)]
 #[command(name = "NYC benchmark runner")]
@@ -61,7 +63,7 @@ struct Args {
     #[arg(long = "skip-read")]
     skip_read: bool,
 
-    #[arg(short, long, default_value_t = String::from("127.0.0.1:3001"))]
+    #[arg(short, long, default_value_t = String::from("127.0.0.1:4001"))]
     endpoint: String,
 }
 
@@ -72,7 +74,12 @@ fn get_file_list<P: AsRef<Path>>(path: P) -> Vec<PathBuf> {
         .collect()
 }
 
+fn new_table_name() -> String {
+    format!("nyc_taxi_{}", chrono::Utc::now().timestamp())
+}
+
 async fn write_data(
+    table_name: &str,
     batch_size: usize,
     db: &Database,
     path: PathBuf,
@@ -97,15 +104,21 @@ async fn write_data(
 
     for record_batch in record_batch_reader {
         let record_batch = record_batch.unwrap();
+        if !is_record_batch_full(&record_batch) {
+            continue;
+        }
         let (columns, row_count) = convert_record_batch(record_batch);
         let request = InsertRequest {
-            table_name: TABLE_NAME.to_string(),
-            region_number: 0,
+            table_name: table_name.to_string(),
             columns,
             row_count,
         };
+        let requests = InsertRequests {
+            inserts: vec![request],
+        };
+
         let now = Instant::now();
-        db.insert(request).await.unwrap();
+        db.insert(requests).await.unwrap();
         let elapsed = now.elapsed();
         total_rpc_elapsed_ms += elapsed.as_millis();
         progress_bar.inc(row_count as _);
@@ -122,12 +135,23 @@ fn convert_record_batch(record_batch: RecordBatch) -> (Vec<Column>, u32) {
     let mut columns = vec![];
 
     for (array, field) in record_batch.columns().iter().zip(fields.iter()) {
-        let values = build_values(array);
+        let (values, datatype) = build_values(array);
+        let semantic_type = match field.name().as_str() {
+            "VendorID" => SemanticType::Tag,
+            "tpep_pickup_datetime" => SemanticType::Timestamp,
+            _ => SemanticType::Field,
+        };
+
         let column = Column {
-            column_name: field.name().to_owned(),
+            column_name: field.name().clone(),
             values: Some(values),
-            null_mask: vec![],
-            // datatype and semantic_type are set to default
+            null_mask: array
+                .to_data()
+                .nulls()
+                .map(|bitmap| bitmap.buffer().as_slice().to_vec())
+                .unwrap_or_default(),
+            datatype: datatype.into(),
+            semantic_type: semantic_type as i32,
             ..Default::default()
         };
         columns.push(column);
@@ -136,7 +160,7 @@ fn convert_record_batch(record_batch: RecordBatch) -> (Vec<Column>, u32) {
     (columns, row_count as _)
 }
 
-fn build_values(column: &ArrayRef) -> Values {
+fn build_values(column: &ArrayRef) -> (Values, ColumnDataType) {
     match column.data_type() {
         DataType::Int64 => {
             let array = column
@@ -144,10 +168,13 @@ fn build_values(column: &ArrayRef) -> Values {
                 .downcast_ref::<PrimitiveArray<Int64Type>>()
                 .unwrap();
             let values = array.values();
-            Values {
-                i64_values: values.to_vec(),
-                ..Default::default()
-            }
+            (
+                Values {
+                    i64_values: values.to_vec(),
+                    ..Default::default()
+                },
+                ColumnDataType::Int64,
+            )
         }
         DataType::Float64 => {
             let array = column
@@ -155,29 +182,38 @@ fn build_values(column: &ArrayRef) -> Values {
                 .downcast_ref::<PrimitiveArray<Float64Type>>()
                 .unwrap();
             let values = array.values();
-            Values {
-                f64_values: values.to_vec(),
-                ..Default::default()
-            }
+            (
+                Values {
+                    f64_values: values.to_vec(),
+                    ..Default::default()
+                },
+                ColumnDataType::Float64,
+            )
         }
         DataType::Timestamp(_, _) => {
             let array = column
                 .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
+                .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
             let values = array.values();
-            Values {
-                i64_values: values.to_vec(),
-                ..Default::default()
-            }
+            (
+                Values {
+                    timestamp_microsecond_values: values.to_vec(),
+                    ..Default::default()
+                },
+                ColumnDataType::TimestampMicrosecond,
+            )
         }
         DataType::Utf8 => {
             let array = column.as_any().downcast_ref::<StringArray>().unwrap();
             let values = array.iter().filter_map(|s| s.map(String::from)).collect();
-            Values {
-                string_values: values,
-                ..Default::default()
-            }
+            (
+                Values {
+                    string_values: values,
+                    ..Default::default()
+                },
+                ColumnDataType::String,
+            )
         }
         DataType::Null
         | DataType::Boolean
@@ -204,166 +240,225 @@ fn build_values(column: &ArrayRef) -> Values {
         | DataType::FixedSizeList(_, _)
         | DataType::LargeList(_)
         | DataType::Struct(_)
-        | DataType::Union(_, _, _)
+        | DataType::Union(_, _)
         | DataType::Dictionary(_, _)
         | DataType::Decimal128(_, _)
         | DataType::Decimal256(_, _)
+        | DataType::RunEndEncoded(_, _)
         | DataType::Map(_, _) => todo!(),
     }
 }
 
-fn create_table_expr() -> CreateTableExpr {
+fn is_record_batch_full(batch: &RecordBatch) -> bool {
+    batch.columns().iter().all(|col| col.null_count() == 0)
+}
+
+fn create_table_expr(table_name: &str) -> CreateTableExpr {
     CreateTableExpr {
         catalog_name: CATALOG_NAME.to_string(),
         schema_name: SCHEMA_NAME.to_string(),
-        table_name: TABLE_NAME.to_string(),
+        table_name: table_name.to_string(),
         desc: "".to_string(),
         column_defs: vec![
             ColumnDef {
                 name: "VendorID".to_string(),
-                datatype: ColumnDataType::Int64 as i32,
+                data_type: ColumnDataType::Int64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Tag as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "tpep_pickup_datetime".to_string(),
-                datatype: ColumnDataType::Int64 as i32,
-                is_nullable: true,
+                data_type: ColumnDataType::TimestampMicrosecond as i32,
+                is_nullable: false,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Timestamp as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "tpep_dropoff_datetime".to_string(),
-                datatype: ColumnDataType::Int64 as i32,
+                data_type: ColumnDataType::TimestampMicrosecond as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "passenger_count".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "trip_distance".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "RatecodeID".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "store_and_fwd_flag".to_string(),
-                datatype: ColumnDataType::String as i32,
+                data_type: ColumnDataType::String as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "PULocationID".to_string(),
-                datatype: ColumnDataType::Int64 as i32,
+                data_type: ColumnDataType::Int64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "DOLocationID".to_string(),
-                datatype: ColumnDataType::Int64 as i32,
+                data_type: ColumnDataType::Int64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "payment_type".to_string(),
-                datatype: ColumnDataType::Int64 as i32,
+                data_type: ColumnDataType::Int64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "fare_amount".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "extra".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "mta_tax".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "tip_amount".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "tolls_amount".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "improvement_surcharge".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "total_amount".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "congestion_surcharge".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "airport_fee".to_string(),
-                datatype: ColumnDataType::Float64 as i32,
+                data_type: ColumnDataType::Float64 as i32,
                 is_nullable: true,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
         ],
         time_index: "tpep_pickup_datetime".to_string(),
         primary_keys: vec!["VendorID".to_string()],
-        create_if_not_exists: false,
+        create_if_not_exists: true,
         table_options: Default::default(),
-        region_ids: vec![0],
-        table_id: Some(TableId { id: 0 }),
+        table_id: None,
+        engine: "mito".to_string(),
     }
 }
 
-fn query_set() -> HashMap<String, String> {
-    let mut ret = HashMap::new();
-
-    ret.insert(
-        "count_all".to_string(),
-        format!("SELECT COUNT(*) FROM {TABLE_NAME};"),
-    );
-
-    ret.insert(
-        "fare_amt_by_passenger".to_string(),
-        format!("SELECT passenger_count, MIN(fare_amount), MAX(fare_amount), SUM(fare_amount) FROM {TABLE_NAME} GROUP BY passenger_count")
-    );
-
-    ret
+fn query_set(table_name: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "count_all".to_string(), 
+            format!("SELECT COUNT(*) FROM {table_name};"),
+        ),
+        (
+            "fare_amt_by_passenger".to_string(),
+            format!("SELECT passenger_count, MIN(fare_amount), MAX(fare_amount), SUM(fare_amount) FROM {table_name} GROUP BY passenger_count"),
+        )
+    ])
 }
 
-async fn do_write(args: &Args, db: &Database) {
+async fn do_write(args: &Args, db: &Database, table_name: &str) {
     let mut file_list = get_file_list(args.path.clone().expect("Specify data path in argument"));
     let mut write_jobs = JoinSet::new();
 
-    let create_table_result = db.create(create_table_expr()).await;
+    let create_table_result = db.create(create_table_expr(table_name)).await;
     println!("Create table result: {create_table_result:?}");
 
     let progress_bar_style = ProgressStyle::with_template(
@@ -381,7 +476,10 @@ async fn do_write(args: &Args, db: &Database) {
             let db = db.clone();
             let mpb = multi_progress_bar.clone();
             let pb_style = progress_bar_style.clone();
-            write_jobs.spawn(async move { write_data(batch_size, &db, path, mpb, pb_style).await });
+            let table_name = table_name.to_string();
+            let _ = write_jobs.spawn(async move {
+                write_data(&table_name, batch_size, &db, path, mpb, pb_style).await
+            });
         }
     }
     while write_jobs.join_next().await.is_some() {
@@ -390,23 +488,32 @@ async fn do_write(args: &Args, db: &Database) {
             let db = db.clone();
             let mpb = multi_progress_bar.clone();
             let pb_style = progress_bar_style.clone();
-            write_jobs.spawn(async move { write_data(batch_size, &db, path, mpb, pb_style).await });
+            let table_name = table_name.to_string();
+            let _ = write_jobs.spawn(async move {
+                write_data(&table_name, batch_size, &db, path, mpb, pb_style).await
+            });
         }
     }
 }
 
-async fn do_query(num_iter: usize, db: &Database) {
-    for (query_name, query) in query_set() {
+async fn do_query(num_iter: usize, db: &Database, table_name: &str) {
+    for (query_name, query) in query_set(table_name) {
         println!("Running query: {query}");
         for i in 0..num_iter {
             let now = Instant::now();
-            let _res = db.sql(&query).await.unwrap();
+            let res = db.sql(&query).await.unwrap();
+            match res {
+                Output::AffectedRows(_) | Output::RecordBatches(_) => (),
+                Output::Stream(stream) => {
+                    stream.try_collect::<Vec<_>>().await.unwrap();
+                }
+            }
             let elapsed = now.elapsed();
             println!(
                 "query {}, iteration {}: {}ms",
                 query_name,
                 i,
-                elapsed.as_millis()
+                elapsed.as_millis(),
             );
         }
     }
@@ -422,14 +529,15 @@ fn main() {
         .unwrap()
         .block_on(async {
             let client = Client::with_urls(vec![&args.endpoint]);
-            let db = Database::with_client(client);
+            let db = Database::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, client);
+            let table_name = new_table_name();
 
             if !args.skip_write {
-                do_write(&args, &db).await;
+                do_write(&args, &db, &table_name).await;
             }
 
             if !args.skip_read {
-                do_query(args.iter_num, &db).await;
+                do_query(args.iter_num, &db, &table_name).await;
             }
         })
 }

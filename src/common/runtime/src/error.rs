@@ -14,26 +14,46 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
+use common_error::ext::ErrorExt;
+use common_macro::stack_trace_debug;
+use snafu::{Location, Snafu};
+use tokio::task::JoinError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub(crate)))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Failed to build runtime, source: {}", source))]
+    #[snafu(display("Failed to build runtime"))]
     BuildRuntime {
-        source: std::io::Error,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: std::io::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Repeated task {} is already started", name))]
+    IllegalState { name: String, location: Location },
+
+    #[snafu(display("Failed to wait for repeated task {} to stop", name))]
+    WaitGcTaskStop {
+        name: String,
+        #[snafu(source)]
+        error: JoinError,
+        location: Location,
     },
 }
 
 impl ErrorExt for Error {
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn location_opt(&self) -> Option<common_error::snafu::Location> {
+        match self {
+            Error::BuildRuntime { location, .. }
+            | Error::IllegalState { location, .. }
+            | Error::WaitGcTaskStop { location, .. } => Some(*location),
+        }
     }
 }

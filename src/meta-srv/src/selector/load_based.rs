@@ -14,197 +14,195 @@
 
 use std::collections::HashMap;
 
-use api::v1::meta::{Peer, RangeRequest};
-use common_time::util as time_util;
+use api::v1::meta::Peer;
+use common_meta::key::TableMetadataManager;
+use common_meta::rpc::router::find_leaders;
+use common_telemetry::{debug, info};
+use parking_lot::RwLock;
+use snafu::ResultExt;
+use table::metadata::TableId;
 
-use super::{Namespace, Selector};
-use crate::error::Result;
-use crate::keys::{LeaseKey, LeaseValue, StatKey, StatValue, DN_STAT_PREFIX};
-use crate::metasrv::Context;
-use crate::service::store::kv::KvStoreRef;
-use crate::{lease, util};
+use crate::error::{self, Result};
+use crate::keys::{LeaseKey, LeaseValue, StatKey, StatValue};
+use crate::lease;
+use crate::metasrv::SelectorContext;
+use crate::selector::common::choose_peers;
+use crate::selector::weight_compute::{RegionNumsBasedWeightCompute, WeightCompute};
+use crate::selector::weighted_choose::{RandomWeightedChoose, WeightedChoose};
+use crate::selector::{Namespace, Selector, SelectorOptions};
 
-pub struct LoadBasedSelector;
+pub struct LoadBasedSelector<W, C> {
+    weighted_choose: RwLock<W>,
+    weight_compute: C,
+}
+
+impl<W, C> LoadBasedSelector<W, C> {
+    pub fn new(weighted_choose: W, weight_compute: C) -> Self {
+        Self {
+            weighted_choose: RwLock::new(weighted_choose),
+            weight_compute,
+        }
+    }
+}
+
+impl Default for LoadBasedSelector<RandomWeightedChoose<Peer>, RegionNumsBasedWeightCompute> {
+    fn default() -> Self {
+        Self {
+            weighted_choose: RwLock::new(RandomWeightedChoose::default()),
+            weight_compute: RegionNumsBasedWeightCompute,
+        }
+    }
+}
 
 #[async_trait::async_trait]
-impl Selector for LoadBasedSelector {
-    type Context = Context;
+impl<W, C> Selector for LoadBasedSelector<W, C>
+where
+    W: WeightedChoose<Peer>,
+    C: WeightCompute<Source = HashMap<StatKey, StatValue>>,
+{
+    type Context = SelectorContext;
     type Output = Vec<Peer>;
 
-    async fn select(&self, ns: Namespace, ctx: &Self::Context) -> Result<Self::Output> {
-        // get alive datanodes
-        let lease_filter = |_: &LeaseKey, v: &LeaseValue| {
-            time_util::current_time_millis() - v.timestamp_millis < ctx.datanode_lease_secs * 1000
+    async fn select(
+        &self,
+        ns: Namespace,
+        ctx: &Self::Context,
+        opts: SelectorOptions,
+    ) -> Result<Self::Output> {
+        // 1. get alive datanodes.
+        let lease_kvs =
+            lease::alive_datanodes(ns, &ctx.meta_peer_client, ctx.datanode_lease_secs).await?;
+
+        // 2. get stat kvs and filter out expired datanodes.
+        let stat_keys = lease_kvs.keys().map(|k| k.into()).collect();
+        let stat_kvs = filter_out_expired_datanode(
+            ctx.meta_peer_client.get_dn_stat_kvs(stat_keys).await?,
+            &lease_kvs,
+        );
+
+        // 3. try to make the regions of a table distributed on different datanodes as much as possible.
+        let stat_kvs = if let Some(table_id) = ctx.table_id {
+            let table_metadata_manager = TableMetadataManager::new(ctx.kv_backend.clone());
+            let leader_peer_ids = get_leader_peer_ids(&table_metadata_manager, table_id).await?;
+            let filter_result = filter_out_datanode_by_table(&stat_kvs, &leader_peer_ids);
+            if filter_result.is_empty() {
+                info!("The regions of the table cannot be allocated to completely different datanodes, table id: {}.", table_id);
+                stat_kvs
+            } else {
+                filter_result
+            }
+        } else {
+            stat_kvs
         };
-        let lease_kvs: HashMap<LeaseKey, LeaseValue> =
-            lease::alive_datanodes(ns, &ctx.kv_store, lease_filter)
-                .await?
-                .into_iter()
-                .collect();
 
-        // get stats of datanodes
-        let stat_kvs = all_stat_kvs(ns, &ctx.kv_store).await?;
+        // 4. compute weight array.
+        let weight_array = self.weight_compute.compute(&stat_kvs);
 
-        // filter out expired datanodes and nodes that cannot get region number
-        let mut tuples: Vec<_> = stat_kvs
-            .iter()
-            .filter_map(|(stat_key, stat_val)| {
-                match (
-                    lease_kvs.get(&to_lease_key(stat_key)),
-                    stat_val.region_num(),
-                ) {
-                    (Some(lease_val), Some(region_num)) => Some((stat_key, lease_val, region_num)),
-                    _ => None,
-                }
+        // 5. choose peers by weight_array.
+        let mut weighted_choose = self.weighted_choose.write();
+        let selected = choose_peers(weight_array, &opts, &mut *weighted_choose)?;
+
+        debug!(
+            "LoadBasedSelector select peers: {:?}, namespace: {}, opts: {:?}.",
+            selected, ns, opts,
+        );
+
+        Ok(selected)
+    }
+}
+
+fn filter_out_expired_datanode(
+    mut stat_kvs: HashMap<StatKey, StatValue>,
+    lease_kvs: &HashMap<LeaseKey, LeaseValue>,
+) -> HashMap<StatKey, StatValue> {
+    lease_kvs
+        .iter()
+        .filter_map(|(lease_k, _)| stat_kvs.remove_entry(&lease_k.into()))
+        .collect()
+}
+
+fn filter_out_datanode_by_table(
+    stat_kvs: &HashMap<StatKey, StatValue>,
+    leader_peer_ids: &[u64],
+) -> HashMap<StatKey, StatValue> {
+    stat_kvs
+        .iter()
+        .filter(|(stat_k, _)| leader_peer_ids.contains(&stat_k.node_id))
+        .map(|(stat_k, stat_v)| (*stat_k, stat_v.clone()))
+        .collect()
+}
+
+async fn get_leader_peer_ids(
+    table_metadata_manager: &TableMetadataManager,
+    table_id: TableId,
+) -> Result<Vec<u64>> {
+    table_metadata_manager
+        .table_route_manager()
+        .get(table_id)
+        .await
+        .context(error::TableMetadataManagerSnafu)
+        .map(|route| {
+            route.map_or_else(Vec::new, |route| {
+                find_leaders(route.region_routes())
+                    .into_iter()
+                    .map(|peer| peer.id)
+                    .collect()
             })
-            .collect();
-
-        // sort the datanodes according to the number of regions
-        tuples.sort_by(|a, b| a.2.cmp(&b.2));
-
-        Ok(tuples
-            .into_iter()
-            .map(|(stat_key, lease_val, _)| Peer {
-                id: stat_key.node_id,
-                addr: lease_val.node_addr.clone(),
-            })
-            .collect())
-    }
-}
-
-// get all stat kvs from store
-pub async fn all_stat_kvs(
-    cluster_id: u64,
-    kv_store: &KvStoreRef,
-) -> Result<Vec<(StatKey, StatValue)>> {
-    let key = stat_prefix(cluster_id);
-    let range_end = util::get_prefix_end_key(&key);
-    let req = RangeRequest {
-        key,
-        range_end,
-        ..Default::default()
-    };
-
-    let kvs = kv_store.range(req).await?.kvs;
-
-    let mut stat_kvs = Vec::with_capacity(kvs.len());
-
-    for kv in kvs {
-        let key: StatKey = kv.key.try_into()?;
-        let value: StatValue = kv.value.try_into()?;
-        stat_kvs.push((key, value));
-    }
-
-    Ok(stat_kvs)
-}
-
-fn to_lease_key(k: &StatKey) -> LeaseKey {
-    LeaseKey {
-        cluster_id: k.cluster_id,
-        node_id: k.node_id,
-    }
-}
-
-fn stat_prefix(cluster_id: u64) -> Vec<u8> {
-    format!("{DN_STAT_PREFIX}-{cluster_id}").into_bytes()
+        })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashMap;
 
-    use api::v1::meta::PutRequest;
-
-    use super::{all_stat_kvs, to_lease_key};
-    use crate::handler::node_stat::Stat;
-    use crate::keys::{StatKey, StatValue};
-    use crate::selector::load_based::stat_prefix;
-    use crate::service::store::kv::{KvStore, KvStoreRef};
-    use crate::service::store::memory::MemStore;
-
-    #[tokio::test]
-    async fn test_all_stat_kvs() {
-        let kv_store = Arc::new(MemStore::new()) as Arc<dyn KvStore>;
-        let kvs = all_stat_kvs(0, &kv_store).await.unwrap();
-        assert!(kvs.is_empty());
-
-        let mut kv_store = Arc::new(MemStore::new()) as Arc<dyn KvStore>;
-        put_stats_to_store(&mut kv_store).await;
-        let kvs = all_stat_kvs(0, &kv_store).await.unwrap();
-        assert_eq!(2, kvs.len());
-        let kvs = all_stat_kvs(1, &kv_store).await.unwrap();
-        assert_eq!(1, kvs.len());
-    }
+    use crate::keys::{LeaseKey, LeaseValue, StatKey, StatValue};
+    use crate::selector::load_based::filter_out_expired_datanode;
 
     #[test]
-    fn test_to_lease_key() {
-        let statkey = StatKey {
-            cluster_id: 1,
-            node_id: 101,
-        };
-        let lease_key = to_lease_key(&statkey);
-        assert_eq!(1, lease_key.cluster_id);
-        assert_eq!(101, lease_key.node_id);
-    }
-
-    #[test]
-    fn test_stat_prefix() {
-        assert_eq!(stat_prefix(1), b"__meta_dnstat-1");
-    }
-
-    async fn put_stats_to_store(store: &mut KvStoreRef) {
-        let put1 = PutRequest {
-            key: StatKey {
-                cluster_id: 0,
-                node_id: 101,
-            }
-            .into(),
-            value: StatValue {
-                stats: vec![Stat {
-                    region_num: Some(100),
-                    ..Default::default()
-                }],
-            }
-            .try_into()
-            .unwrap(),
-            ..Default::default()
-        };
-        store.put(put1).await.unwrap();
-
-        let put2 = PutRequest {
-            key: StatKey {
-                cluster_id: 0,
-                node_id: 102,
-            }
-            .into(),
-            value: StatValue {
-                stats: vec![Stat {
-                    region_num: Some(99),
-                    ..Default::default()
-                }],
-            }
-            .try_into()
-            .unwrap(),
-            ..Default::default()
-        };
-        store.put(put2).await.unwrap();
-
-        let put3 = PutRequest {
-            key: StatKey {
+    fn test_filter_out_expired_datanode() {
+        let mut stat_kvs = HashMap::new();
+        stat_kvs.insert(
+            StatKey {
                 cluster_id: 1,
-                node_id: 103,
-            }
-            .into(),
-            value: StatValue {
-                stats: vec![Stat {
-                    region_num: Some(98),
-                    ..Default::default()
-                }],
-            }
-            .try_into()
-            .unwrap(),
-            ..Default::default()
-        };
-        store.put(put3).await.unwrap();
+                node_id: 0,
+            },
+            StatValue { stats: vec![] },
+        );
+        stat_kvs.insert(
+            StatKey {
+                cluster_id: 1,
+                node_id: 1,
+            },
+            StatValue { stats: vec![] },
+        );
+        stat_kvs.insert(
+            StatKey {
+                cluster_id: 1,
+                node_id: 2,
+            },
+            StatValue { stats: vec![] },
+        );
+
+        let mut lease_kvs = HashMap::new();
+        lease_kvs.insert(
+            LeaseKey {
+                cluster_id: 1,
+                node_id: 1,
+            },
+            LeaseValue {
+                timestamp_millis: 0,
+                node_addr: "127.0.0.1:3002".to_string(),
+            },
+        );
+
+        let alive_stat_kvs = filter_out_expired_datanode(stat_kvs, &lease_kvs);
+
+        assert_eq!(1, alive_stat_kvs.len());
+        assert!(alive_stat_kvs
+            .get(&StatKey {
+                cluster_id: 1,
+                node_id: 1
+            })
+            .is_some());
     }
 }

@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+use std::slice;
+use std::sync::Arc;
+
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datatypes::schema::SchemaRef;
 use datatypes::value::Value;
 use datatypes::vectors::{Helper, VectorRef};
 use serde::ser::{Error, SerializeStruct};
 use serde::{Serialize, Serializer};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
-use crate::error::{self, Result};
+use crate::error::{
+    self, CastVectorSnafu, ColumnNotExistsSnafu, DataTypesSnafu, ProjectArrowRecordBatchSnafu,
+    Result,
+};
 use crate::DfRecordBatch;
 
 /// A two-dimensional batch of column-oriented data with a defined schema.
@@ -43,6 +51,36 @@ impl RecordBatch {
             .context(error::NewDfRecordBatchSnafu)?;
 
         Ok(RecordBatch {
+            schema,
+            columns,
+            df_record_batch,
+        })
+    }
+
+    /// Create an empty [`RecordBatch`] from `schema`.
+    pub fn new_empty(schema: SchemaRef) -> Result<RecordBatch> {
+        let df_record_batch = DfRecordBatch::new_empty(schema.arrow_schema().clone());
+        Ok(RecordBatch {
+            schema,
+            columns: vec![],
+            df_record_batch,
+        })
+    }
+
+    pub fn try_project(&self, indices: &[usize]) -> Result<Self> {
+        let schema = Arc::new(self.schema.try_project(indices).context(DataTypesSnafu)?);
+        let mut columns = Vec::with_capacity(indices.len());
+        for index in indices {
+            columns.push(self.columns[*index].clone());
+        }
+        let df_record_batch = self.df_record_batch.project(indices).with_context(|_| {
+            ProjectArrowRecordBatchSnafu {
+                schema: self.schema.clone(),
+                projection: indices.to_vec(),
+            }
+        })?;
+
+        Ok(Self {
             schema,
             columns,
             df_record_batch,
@@ -107,6 +145,48 @@ impl RecordBatch {
     /// Create an iterator to traverse the data by row
     pub fn rows(&self) -> RecordBatchRowIterator<'_> {
         RecordBatchRowIterator::new(self)
+    }
+
+    pub fn column_vectors(
+        &self,
+        table_name: &str,
+        table_schema: SchemaRef,
+    ) -> Result<HashMap<String, VectorRef>> {
+        let mut vectors = HashMap::with_capacity(self.num_columns());
+
+        // column schemas in recordbatch must match its vectors, otherwise it's corrupted
+        for (vector_schema, vector) in self.schema.column_schemas().iter().zip(self.columns.iter())
+        {
+            let column_name = &vector_schema.name;
+            let column_schema =
+                table_schema
+                    .column_schema_by_name(column_name)
+                    .context(ColumnNotExistsSnafu {
+                        table_name,
+                        column_name,
+                    })?;
+            let vector = if vector_schema.data_type != column_schema.data_type {
+                vector
+                    .cast(&column_schema.data_type)
+                    .with_context(|_| CastVectorSnafu {
+                        from_type: vector.data_type(),
+                        to_type: column_schema.data_type.clone(),
+                    })?
+            } else {
+                vector.clone()
+            };
+
+            let _ = vectors.insert(column_name.clone(), vector);
+        }
+
+        Ok(vectors)
+    }
+
+    /// Pretty display this record batch like a table
+    pub fn pretty_print(&self) -> String {
+        pretty_format_batches(slice::from_ref(&self.df_record_batch))
+            .map(|t| t.to_string())
+            .unwrap_or("failed to pretty display a record batch".to_string())
     }
 }
 
@@ -189,8 +269,8 @@ mod tests {
         ]));
         let schema = Arc::new(Schema::try_from(arrow_schema).unwrap());
 
-        let c1 = Arc::new(UInt32Vector::from_slice(&[1, 2, 3]));
-        let c2 = Arc::new(UInt32Vector::from_slice(&[4, 5, 6]));
+        let c1 = Arc::new(UInt32Vector::from_slice([1, 2, 3]));
+        let c2 = Arc::new(UInt32Vector::from_slice([4, 5, 6]));
         let columns: Vec<VectorRef> = vec![c1, c2];
 
         let batch = RecordBatch::new(schema.clone(), columns.clone()).unwrap();
@@ -222,7 +302,7 @@ mod tests {
         let schema = Arc::new(Schema::try_new(column_schemas).unwrap());
 
         let numbers: Vec<u32> = (0..10).collect();
-        let columns = vec![Arc::new(UInt32Vector::from_slice(&numbers)) as VectorRef];
+        let columns = vec![Arc::new(UInt32Vector::from_slice(numbers)) as VectorRef];
         let batch = RecordBatch::new(schema, columns).unwrap();
 
         let output = serde_json::to_string(&batch).unwrap();

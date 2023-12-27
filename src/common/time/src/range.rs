@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::{Debug, Display, Formatter};
+
+use serde::{Deserialize, Serialize};
+
 use crate::timestamp::TimeUnit;
 use crate::timestamp_millis::TimestampMillis;
 use crate::Timestamp;
@@ -21,7 +25,7 @@ use crate::Timestamp;
 /// The range contains values that `value >= start` and `val < end`.
 ///
 /// The range is empty iff `start == end == "the default value of T"`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GenericRange<T> {
     start: Option<T>,
     end: Option<T>,
@@ -193,6 +197,38 @@ impl<T: PartialOrd> GenericRange<T> {
 
 pub type TimestampRange = GenericRange<Timestamp>;
 
+impl Display for TimestampRange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match (&self.start, &self.end) {
+            (Some(start), Some(end)) => {
+                format!(
+                    "TimestampRange{{[{}{},{}{})}}",
+                    start.value(),
+                    start.unit().short_name(),
+                    end.value(),
+                    end.unit().short_name()
+                )
+            }
+            (Some(start), None) => {
+                format!(
+                    "TimestampRange{{[{}{},#)}}",
+                    start.value(),
+                    start.unit().short_name()
+                )
+            }
+            (None, Some(end)) => {
+                format!(
+                    "TimestampRange{{[#,{}{})}}",
+                    end.value(),
+                    end.unit().short_name()
+                )
+            }
+            (None, None) => "TimestampRange{{[#,#)}}".to_string(),
+        };
+        f.write_str(&s)
+    }
+}
+
 impl TimestampRange {
     /// Create a TimestampRange with optional inclusive end timestamp.
     /// If end timestamp is present and is less than start timestamp, this method will return
@@ -205,7 +241,7 @@ impl TimestampRange {
     pub fn new_inclusive(start: Option<Timestamp>, end: Option<Timestamp>) -> Self {
         // check for emptiness
         if let (Some(start_ts), Some(end_ts)) = (start, end) {
-            if start_ts >= end_ts {
+            if start_ts > end_ts {
                 return Self::empty();
             }
         }
@@ -221,6 +257,7 @@ impl TimestampRange {
     }
 
     /// Shortcut method to create a timestamp range with given start/end value and time unit.
+    /// Returns empty iff `start` > `end`.
     pub fn with_unit(start: i64, end: i64, unit: TimeUnit) -> Option<Self> {
         let start = Timestamp::new(start, unit);
         let end = Timestamp::new(end, unit);
@@ -461,5 +498,51 @@ mod tests {
         assert!(full.intersects(&full));
 
         assert!(!full.intersects(&empty));
+    }
+
+    #[test]
+    fn test_new_inclusive() {
+        let range = TimestampRange::new_inclusive(
+            Some(Timestamp::new_millisecond(1)),
+            Some(Timestamp::new_millisecond(3)),
+        );
+        assert!(!range.is_empty());
+        assert!(range.contains(&Timestamp::new_millisecond(1)));
+        assert!(range.contains(&Timestamp::new_millisecond(3)));
+
+        let range = TimestampRange::new_inclusive(
+            Some(Timestamp::new_millisecond(1)),
+            Some(Timestamp::new_millisecond(1)),
+        );
+        assert!(!range.is_empty());
+        assert_eq!(1, range.start.unwrap().value());
+        assert!(range.contains(&Timestamp::new_millisecond(1)));
+
+        let range = TimestampRange::new_inclusive(
+            Some(Timestamp::new_millisecond(2)),
+            Some(Timestamp::new_millisecond(1)),
+        );
+        assert!(range.is_empty());
+    }
+
+    #[test]
+    fn test_serialize_timestamp_range() {
+        macro_rules! test_serde_for_unit {
+            ($($unit: expr),*) => {
+                $(
+                let original_range = TimestampRange::with_unit(0, 10, $unit).unwrap();
+                let string = serde_json::to_string(&original_range).unwrap();
+                let deserialized: TimestampRange = serde_json::from_str(&string).unwrap();
+                assert_eq!(original_range, deserialized);
+                )*
+            };
+        }
+
+        test_serde_for_unit!(
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond
+        );
     }
 }

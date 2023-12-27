@@ -78,7 +78,7 @@ impl FromRow for MysqlTextRow {
             let value = if let Some(mysql_value) = row.as_ref(i) {
                 match mysql_value {
                     MysqlValue::NULL => Value::Null,
-                    MysqlValue::Bytes(v) => Value::from(v.to_vec()),
+                    MysqlValue::Bytes(v) => Value::from(v.clone()),
                     _ => unreachable!(),
                 }
             } else {
@@ -119,7 +119,7 @@ pub fn all_datatype_testing_data() -> TestingData {
         ColumnType::MYSQL_TYPE_LONG,
         ColumnType::MYSQL_TYPE_LONGLONG,
         ColumnType::MYSQL_TYPE_FLOAT,
-        ColumnType::MYSQL_TYPE_FLOAT,
+        ColumnType::MYSQL_TYPE_DOUBLE,
         ColumnType::MYSQL_TYPE_VARCHAR,
         ColumnType::MYSQL_TYPE_VARCHAR,
     ];

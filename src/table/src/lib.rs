@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(assert_matches)]
+
+pub mod dist_table;
 pub mod engine;
 pub mod error;
 pub mod metadata;
 pub mod predicate;
 pub mod requests;
+pub mod stats;
 pub mod table;
 pub mod test_util;
+pub mod thin_table;
 
 pub use crate::error::{Error, Result};
+pub use crate::stats::{ColumnStatistics, TableStatistics};
 pub use crate::table::{Table, TableRef};

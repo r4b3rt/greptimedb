@@ -14,88 +14,121 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use datafusion::error::DataFusionError;
-use promql_parser::label::Label;
-use promql_parser::parser::{Expr as PromExpr, TokenType};
+use promql_parser::parser::{Expr as PromExpr, TokenType, VectorMatchCardinality};
+use snafu::{Location, Snafu};
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
     #[snafu(display("Unsupported expr type: {}", name))]
-    UnsupportedExpr { name: String, backtrace: Backtrace },
+    UnsupportedExpr { name: String, location: Location },
 
-    #[snafu(display("Unexpected token: {}", token))]
-    UnexpectedToken {
-        token: TokenType,
-        backtrace: Backtrace,
+    #[snafu(display("Unsupported vector matches: {:?}", name))]
+    UnsupportedVectorMatch {
+        name: VectorMatchCardinality,
+        location: Location,
     },
 
-    #[snafu(display("Internal error during build DataFusion plan, error: {}", source))]
+    #[snafu(display("Unexpected token: {:?}", token))]
+    UnexpectedToken {
+        token: TokenType,
+        location: Location,
+    },
+
+    #[snafu(display("Internal error during building DataFusion plan"))]
     DataFusionPlanning {
-        source: datafusion::error::DataFusionError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+        location: Location,
     },
 
     #[snafu(display("Unexpected plan or expression: {}", desc))]
-    UnexpectedPlanExpr { desc: String, backtrace: Backtrace },
+    UnexpectedPlanExpr { desc: String, location: Location },
 
     #[snafu(display("Unknown table type, downcast failed"))]
-    UnknownTable { backtrace: Backtrace },
+    UnknownTable { location: Location },
 
     #[snafu(display("Cannot find time index column in table {}", table))]
-    TimeIndexNotFound { table: String, backtrace: Backtrace },
+    TimeIndexNotFound { table: String, location: Location },
 
     #[snafu(display("Cannot find value columns in table {}", table))]
-    ValueNotFound { table: String, backtrace: Backtrace },
-
-    #[snafu(display("Cannot find label {} in table {}", label, table,))]
-    LabelNotFound {
-        table: String,
-        label: Label,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Cannot find the table {}", table))]
-    TableNotFound {
-        table: String,
-        source: datafusion::error::DataFusionError,
-    },
+    ValueNotFound { table: String, location: Location },
 
     #[snafu(display(
         "Cannot accept multiple vector as function input, PromQL expr: {:?}",
-        expr
+        expr,
     ))]
-    MultipleVector {
-        expr: PromExpr,
-        backtrace: Backtrace,
-    },
+    MultipleVector { expr: PromExpr, location: Location },
 
     #[snafu(display("Expect a PromQL expr but not found, input expr: {:?}", expr))]
-    ExpectExpr {
-        expr: PromExpr,
-        backtrace: Backtrace,
-    },
+    ExpectExpr { expr: PromExpr, location: Location },
     #[snafu(display(
         "Illegal range: offset {}, length {}, array len {}",
         offset,
         length,
-        len
+        len,
     ))]
     IllegalRange {
         offset: u32,
         length: u32,
         len: usize,
-        backtrace: Backtrace,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to deserialize"))]
+    Deserialize {
+        #[snafu(source)]
+        error: prost::DecodeError,
+        location: Location,
     },
 
     #[snafu(display("Empty range is not expected"))]
-    EmptyRange { backtrace: Backtrace },
+    EmptyRange { location: Location },
 
     #[snafu(display(
         "Table (metric) name not found, this indicates a procedure error in PromQL planner"
     ))]
-    TableNameNotFound { backtrace: Backtrace },
+    TableNameNotFound { location: Location },
+
+    #[snafu(display("General catalog error: "))]
+    Catalog {
+        location: Location,
+        source: catalog::error::Error,
+    },
+
+    #[snafu(display("Expect a range selector, but not found"))]
+    ExpectRangeSelector { location: Location },
+
+    #[snafu(display("Zero range in range selector"))]
+    ZeroRangeSelector { location: Location },
+
+    #[snafu(display("Cannot find column {col}"))]
+    ColumnNotFound { col: String, location: Location },
+
+    #[snafu(display("Found multiple metric matchers in selector"))]
+    MultipleMetricMatchers { location: Location },
+
+    #[snafu(display("Expect a metric matcher, but not found"))]
+    NoMetricMatcher { location: Location },
+
+    #[snafu(display("Invalid function argument for {}", fn_name))]
+    FunctionInvalidArgument { fn_name: String, location: Location },
+
+    #[snafu(display(
+        "Attempt to combine two tables with different column sets, left: {:?}, right: {:?}",
+        left,
+        right
+    ))]
+    CombineTableColumnMismatch {
+        left: Vec<String>,
+        right: Vec<String>,
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
@@ -107,19 +140,26 @@ impl ErrorExt for Error {
             | UnsupportedExpr { .. }
             | UnexpectedToken { .. }
             | MultipleVector { .. }
-            | LabelNotFound { .. }
-            | ExpectExpr { .. } => StatusCode::InvalidArguments,
-            UnknownTable { .. }
-            | TableNotFound { .. }
+            | ExpectExpr { .. }
+            | ExpectRangeSelector { .. }
+            | ZeroRangeSelector { .. }
+            | ColumnNotFound { .. }
+            | Deserialize { .. }
+            | FunctionInvalidArgument { .. }
+            | UnsupportedVectorMatch { .. }
+            | CombineTableColumnMismatch { .. }
             | DataFusionPlanning { .. }
             | UnexpectedPlanExpr { .. }
-            | IllegalRange { .. }
-            | EmptyRange { .. }
-            | TableNameNotFound { .. } => StatusCode::Internal,
+            | IllegalRange { .. } => StatusCode::InvalidArguments,
+
+            UnknownTable { .. } | EmptyRange { .. } => StatusCode::Internal,
+
+            TableNameNotFound { .. } => StatusCode::TableNotFound,
+
+            MultipleMetricMatchers { .. } | NoMetricMatcher { .. } => StatusCode::InvalidSyntax,
+
+            Catalog { source, .. } => source.status_code(),
         }
-    }
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {

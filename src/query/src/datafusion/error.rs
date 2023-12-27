@@ -14,54 +14,42 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use datafusion::error::DataFusionError;
+use snafu::{Location, Snafu};
 
 /// Inner error of datafusion based query engine.
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum InnerError {
-    #[snafu(display("{}: {}", msg, source))]
+    #[snafu(display("DataFusion error"))]
     Datafusion {
-        msg: &'static str,
-        source: DataFusionError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: DataFusionError,
+        location: Location,
     },
 
     #[snafu(display("PhysicalPlan downcast failed"))]
-    PhysicalPlanDowncast { backtrace: Backtrace },
+    PhysicalPlanDowncast { location: Location },
 
-    #[snafu(display("Cannot plan SQL: {}, source: {}", sql, source))]
-    PlanSql {
-        sql: String,
-        source: DataFusionError,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Fail to convert arrow schema, source: {}", source))]
+    #[snafu(display("Fail to convert arrow schema"))]
     ConvertSchema {
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
     },
 
-    #[snafu(display("Failed to convert table schema, source: {}", source))]
-    TableSchemaMismatch {
-        #[snafu(backtrace)]
-        source: table::error::Error,
-    },
-
-    #[snafu(display(
-        "Failed to convert DataFusion's recordbatch stream, source: {}",
-        source
-    ))]
+    #[snafu(display("Failed to convert DataFusion's recordbatch stream"))]
     ConvertDfRecordBatchStream {
-        #[snafu(backtrace)]
+        location: Location,
         source: common_recordbatch::error::Error,
     },
 
-    #[snafu(display("Failed to execute physical plan, source: {}", source))]
+    #[snafu(display("Failed to execute physical plan"))]
     ExecutePhysicalPlan {
-        #[snafu(backtrace)]
+        location: Location,
         source: common_query::error::Error,
     },
 }
@@ -73,55 +61,13 @@ impl ErrorExt for InnerError {
         match self {
             // TODO(yingwen): Further categorize datafusion error.
             Datafusion { .. } => StatusCode::EngineExecuteQuery,
-            // This downcast should not fail in usual case.
-            PhysicalPlanDowncast { .. } | ConvertSchema { .. } | TableSchemaMismatch { .. } => {
-                StatusCode::Unexpected
-            }
-            PlanSql { .. } => StatusCode::PlanQuery,
-            ConvertDfRecordBatchStream { source } => source.status_code(),
-            ExecutePhysicalPlan { source } => source.status_code(),
+            PhysicalPlanDowncast { .. } | ConvertSchema { .. } => StatusCode::Unexpected,
+            ConvertDfRecordBatchStream { source, .. } => source.status_code(),
+            ExecutePhysicalPlan { source, .. } => source.status_code(),
         }
-    }
-
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    fn throw_df_error() -> Result<(), DataFusionError> {
-        Err(DataFusionError::NotImplemented("test".to_string()))
-    }
-
-    fn assert_error(err: &InnerError, code: StatusCode) {
-        assert_eq!(code, err.status_code());
-        assert!(err.backtrace_opt().is_some());
-    }
-
-    #[test]
-    fn test_datafusion_as_source() {
-        let err = throw_df_error()
-            .context(DatafusionSnafu { msg: "test df" })
-            .err()
-            .unwrap();
-        assert_error(&err, StatusCode::EngineExecuteQuery);
-
-        let err = throw_df_error()
-            .context(PlanSqlSnafu { sql: "" })
-            .err()
-            .unwrap();
-        assert_error(&err, StatusCode::PlanQuery);
-
-        let res: Result<(), InnerError> = PhysicalPlanDowncastSnafu {}.fail();
-        let err = res.err().unwrap();
-        assert_error(&err, StatusCode::Unexpected);
     }
 }

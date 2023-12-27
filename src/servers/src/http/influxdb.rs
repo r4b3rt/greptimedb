@@ -13,43 +13,94 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use axum::response::IntoResponse;
+use axum::Extension;
+use common_catalog::consts::DEFAULT_SCHEMA_NAME;
 use common_grpc::writer::Precision;
-use session::context::QueryContext;
+use session::context::QueryContextRef;
 
 use crate::error::{Result, TimePrecisionSnafu};
 use crate::influxdb::InfluxdbRequest;
 use crate::query_handler::InfluxdbLineProtocolHandlerRef;
 
+// https://docs.influxdata.com/influxdb/v1.8/tools/api/#ping-http-endpoint
 #[axum_macros::debug_handler]
-pub async fn influxdb_write(
+pub async fn influxdb_ping() -> Result<impl IntoResponse> {
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// https://docs.influxdata.com/influxdb/v1.8/tools/api/#health-http-endpoint
+#[axum_macros::debug_handler]
+pub async fn influxdb_health() -> Result<impl IntoResponse> {
+    Ok(StatusCode::OK)
+}
+
+#[axum_macros::debug_handler]
+pub async fn influxdb_write_v1(
     State(handler): State<InfluxdbLineProtocolHandlerRef>,
     Query(mut params): Query<HashMap<String, String>>,
+    Extension(query_ctx): Extension<QueryContextRef>,
     lines: String,
-) -> Result<(StatusCode, ())> {
+) -> Result<impl IntoResponse> {
     let db = params
         .remove("db")
         .unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string());
-    let ctx = Arc::new(QueryContext::with(DEFAULT_CATALOG_NAME, &db));
 
     let precision = params
         .get("precision")
         .map(|val| parse_time_precision(val))
         .transpose()?;
-    let request = InfluxdbRequest { precision, lines };
 
-    handler.exec(&request, ctx).await?;
+    influxdb_write(&db, precision, lines, handler, query_ctx).await
+}
+
+#[axum_macros::debug_handler]
+pub async fn influxdb_write_v2(
+    State(handler): State<InfluxdbLineProtocolHandlerRef>,
+    Query(mut params): Query<HashMap<String, String>>,
+    Extension(query_ctx): Extension<QueryContextRef>,
+    lines: String,
+) -> Result<impl IntoResponse> {
+    let db = params
+        .remove("bucket")
+        .unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string());
+
+    let precision = params
+        .get("precision")
+        .map(|val| parse_time_precision(val))
+        .transpose()?;
+
+    influxdb_write(&db, precision, lines, handler, query_ctx).await
+}
+
+pub async fn influxdb_write(
+    db: &str,
+    precision: Option<Precision>,
+    lines: String,
+    handler: InfluxdbLineProtocolHandlerRef,
+    ctx: QueryContextRef,
+) -> Result<impl IntoResponse> {
+    let _timer = crate::metrics::METRIC_HTTP_INFLUXDB_WRITE_ELAPSED
+        .with_label_values(&[db])
+        .start_timer();
+
+    let request = InfluxdbRequest { precision, lines };
+    handler.exec(request, ctx).await?;
+
     Ok((StatusCode::NO_CONTENT, ()))
 }
 
 fn parse_time_precision(value: &str) -> Result<Precision> {
+    // Precision conversion needs to be compatible with influxdb v1 v2 api.
+    // For details, see the Influxdb documents.
+    // https://docs.influxdata.com/influxdb/v1.8/tools/api/#apiv2write-http-endpoint
+    // https://docs.influxdata.com/influxdb/v1.8/tools/api/#write-http-endpoint
     match value {
-        "n" => Ok(Precision::Nanosecond),
-        "u" => Ok(Precision::Microsecond),
+        "n" | "ns" => Ok(Precision::Nanosecond),
+        "u" | "us" => Ok(Precision::Microsecond),
         "ms" => Ok(Precision::Millisecond),
         "s" => Ok(Precision::Second),
         "m" => Ok(Precision::Minute),
@@ -70,7 +121,9 @@ mod tests {
     #[test]
     fn test_parse_time_precision() {
         assert_eq!(Precision::Nanosecond, parse_time_precision("n").unwrap());
+        assert_eq!(Precision::Nanosecond, parse_time_precision("ns").unwrap());
         assert_eq!(Precision::Microsecond, parse_time_precision("u").unwrap());
+        assert_eq!(Precision::Microsecond, parse_time_precision("us").unwrap());
         assert_eq!(Precision::Millisecond, parse_time_precision("ms").unwrap());
         assert_eq!(Precision::Second, parse_time_precision("s").unwrap());
         assert_eq!(Precision::Minute, parse_time_precision("m").unwrap());

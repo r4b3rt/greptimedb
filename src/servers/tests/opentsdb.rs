@@ -27,6 +27,7 @@ use servers::opentsdb::connection::Connection;
 use servers::opentsdb::OpentsdbServer;
 use servers::query_handler::OpentsdbProtocolHandler;
 use servers::server::Server;
+use session::context::QueryContextRef;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 
@@ -36,8 +37,8 @@ struct DummyOpentsdbInstance {
 
 #[async_trait]
 impl OpentsdbProtocolHandler for DummyOpentsdbInstance {
-    async fn exec(&self, data_point: &DataPoint) -> Result<()> {
-        let metric = data_point.metric();
+    async fn exec(&self, data_points: Vec<DataPoint>, _ctx: QueryContextRef) -> Result<usize> {
+        let metric = data_points.first().unwrap().metric();
         if metric == "should_failed" {
             return server_error::InternalSnafu {
                 err_msg: "expected",
@@ -46,7 +47,7 @@ impl OpentsdbProtocolHandler for DummyOpentsdbInstance {
         }
         let i = metric.parse::<i32>().unwrap();
         let _ = self.tx.send(i * i).await;
-        Ok(())
+        Ok(data_points.len())
     }
 }
 
@@ -68,7 +69,7 @@ async fn test_start_opentsdb_server() -> Result<()> {
     let server = create_opentsdb_server(tx)?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let result = server.start(listening).await;
-    assert!(result.is_ok());
+    let _ = result.unwrap();
 
     let result = server.start(listening).await;
     assert!(result
@@ -203,7 +204,7 @@ async fn test_opentsdb_connect_after_shutdown() -> Result<()> {
 
     server.shutdown().await.unwrap();
 
-    TcpStream::connect(addr).await.unwrap_err();
+    assert!(TcpStream::connect(addr).await.is_err());
 
     Ok(())
 }

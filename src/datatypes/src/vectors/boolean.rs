@@ -16,9 +16,7 @@ use std::any::Any;
 use std::borrow::Borrow;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayBuilder, ArrayData, ArrayIter, ArrayRef, BooleanArray, BooleanBuilder,
-};
+use arrow::array::{Array, ArrayBuilder, ArrayIter, ArrayRef, BooleanArray, BooleanBuilder};
 use snafu::ResultExt;
 
 use crate::data_type::ConcreteDataType;
@@ -39,18 +37,9 @@ impl BooleanVector {
         &self.array
     }
 
-    pub(crate) fn as_boolean_array(&self) -> &BooleanArray {
+    /// Get the inner boolean array.
+    pub fn as_boolean_array(&self) -> &BooleanArray {
         &self.array
-    }
-
-    fn to_array_data(&self) -> ArrayData {
-        self.array.data().clone()
-    }
-
-    fn from_array_data(data: ArrayData) -> BooleanVector {
-        BooleanVector {
-            array: BooleanArray::from(data),
-        }
     }
 
     pub(crate) fn false_count(&self) -> usize {
@@ -106,13 +95,11 @@ impl Vector for BooleanVector {
     }
 
     fn to_arrow_array(&self) -> ArrayRef {
-        let data = self.to_array_data();
-        Arc::new(BooleanArray::from(data))
+        Arc::new(self.array.clone())
     }
 
     fn to_boxed_arrow_array(&self) -> Box<dyn Array> {
-        let data = self.to_array_data();
-        Box::new(BooleanArray::from(data))
+        Box::new(self.array.clone())
     }
 
     fn validity(&self) -> Validity {
@@ -132,8 +119,7 @@ impl Vector for BooleanVector {
     }
 
     fn slice(&self, offset: usize, length: usize) -> VectorRef {
-        let data = self.array.data().slice(offset, length);
-        Arc::new(Self::from_array_data(data))
+        Arc::new(Self::from(self.array.slice(offset, length)))
     }
 
     fn get(&self, index: usize) -> Value {
@@ -189,7 +175,11 @@ impl MutableVector for BooleanVectorBuilder {
         Arc::new(self.finish())
     }
 
-    fn push_value_ref(&mut self, value: ValueRef) -> Result<()> {
+    fn to_vector_cloned(&self) -> VectorRef {
+        Arc::new(self.finish_cloned())
+    }
+
+    fn try_push_value_ref(&mut self, value: ValueRef) -> Result<()> {
         match value.as_boolean()? {
             Some(v) => self.mutable_array.append_value(v),
             None => self.mutable_array.append_null(),
@@ -199,6 +189,10 @@ impl MutableVector for BooleanVectorBuilder {
 
     fn extend_slice_of(&mut self, vector: &dyn Vector, offset: usize, length: usize) -> Result<()> {
         vectors::impl_extend_for_builder!(self, vector, BooleanVector, offset, length)
+    }
+
+    fn push_null(&mut self) {
+        self.mutable_array.append_null()
     }
 }
 
@@ -221,6 +215,12 @@ impl ScalarVectorBuilder for BooleanVectorBuilder {
     fn finish(&mut self) -> Self::VectorType {
         BooleanVector {
             array: self.mutable_array.finish(),
+        }
+    }
+
+    fn finish_cloned(&self) -> Self::VectorType {
+        BooleanVector {
+            array: self.mutable_array.finish_cloned(),
         }
     }
 }
@@ -255,7 +255,7 @@ mod tests {
         assert!(!v.is_const());
         assert!(v.validity().is_all_valid());
         assert!(!v.only_null());
-        assert_eq!(64, v.memory_size());
+        assert_eq!(2, v.memory_size());
 
         for (i, b) in bools.iter().enumerate() {
             assert!(!v.is_null(i));
@@ -356,16 +356,33 @@ mod tests {
     fn test_boolean_vector_builder() {
         let input = BooleanVector::from_slice(&[true, false, true]);
 
-        let mut builder = BooleanType::default().create_mutable_vector(3);
-        builder.push_value_ref(ValueRef::Boolean(true)).unwrap();
-        assert!(builder.push_value_ref(ValueRef::Int32(123)).is_err());
+        let mut builder = BooleanType.create_mutable_vector(3);
+        builder.push_value_ref(ValueRef::Boolean(true));
+        assert!(builder.try_push_value_ref(ValueRef::Int32(123)).is_err());
         builder.extend_slice_of(&input, 1, 2).unwrap();
         assert!(builder
-            .extend_slice_of(&crate::vectors::Int32Vector::from_slice(&[13]), 0, 1)
+            .extend_slice_of(&crate::vectors::Int32Vector::from_slice([13]), 0, 1)
             .is_err());
         let vector = builder.to_vector();
 
         let expect: VectorRef = Arc::new(BooleanVector::from_slice(&[true, false, true]));
         assert_eq!(expect, vector);
+    }
+
+    #[test]
+    fn test_boolean_vector_builder_finish_cloned() {
+        let mut builder = BooleanVectorBuilder::with_capacity(1024);
+        builder.push(Some(true));
+        builder.push(Some(false));
+        builder.push(Some(true));
+        let vector = builder.finish_cloned();
+        assert!(vector.get_data(0).unwrap());
+        assert_eq!(vector.len(), 3);
+        assert_eq!(builder.len(), 3);
+
+        builder.push(Some(false));
+        let vector = builder.finish_cloned();
+        assert!(!vector.get_data(3).unwrap());
+        assert_eq!(builder.len(), 4);
     }
 }

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow::datatypes::{DataType as ArrowDataType, Field};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +23,7 @@ use crate::value::{ListValue, Value};
 use crate::vectors::{ListVectorBuilder, MutableVector};
 
 /// Used to represent the List datatype.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ListType {
     /// The type of List's item.
     // Use Box to avoid recursive dependency, as enum ConcreteDataType depends on ListType.
@@ -50,8 +52,8 @@ impl ListType {
 }
 
 impl DataType for ListType {
-    fn name(&self) -> &str {
-        "List"
+    fn name(&self) -> String {
+        format!("List<{}>", self.item_type.name())
     }
 
     fn logical_type_id(&self) -> LogicalTypeId {
@@ -63,7 +65,7 @@ impl DataType for ListType {
     }
 
     fn as_arrow_type(&self) -> ArrowDataType {
-        let field = Box::new(Field::new("item", self.item_type.as_arrow_type(), true));
+        let field = Arc::new(Field::new("item", self.item_type.as_arrow_type(), true));
         ArrowDataType::List(field)
     }
 
@@ -74,8 +76,11 @@ impl DataType for ListType {
         ))
     }
 
-    fn is_timestamp_compatible(&self) -> bool {
-        false
+    fn try_cast(&self, from: Value) -> Option<Value> {
+        match from {
+            Value::List(v) => Some(Value::List(v)),
+            _ => None,
+        }
     }
 }
 
@@ -87,14 +92,14 @@ mod tests {
     #[test]
     fn test_list_type() {
         let t = ListType::new(ConcreteDataType::boolean_datatype());
-        assert_eq!("List", t.name());
+        assert_eq!("List<Boolean>", t.name());
         assert_eq!(LogicalTypeId::List, t.logical_type_id());
         assert_eq!(
             Value::List(ListValue::new(None, ConcreteDataType::boolean_datatype())),
             t.default_value()
         );
         assert_eq!(
-            ArrowDataType::List(Box::new(Field::new("item", ArrowDataType::Boolean, true))),
+            ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Boolean, true))),
             t.as_arrow_type()
         );
         assert_eq!(ConcreteDataType::boolean_datatype(), *t.item_type());

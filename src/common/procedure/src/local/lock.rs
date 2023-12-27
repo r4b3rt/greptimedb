@@ -54,13 +54,13 @@ impl Lock {
 }
 
 /// Manages lock entries for procedures.
-struct LockMap {
+pub(crate) struct LockMap {
     locks: RwLock<HashMap<String, Lock>>,
 }
 
 impl LockMap {
     /// Returns a new [LockMap].
-    fn new() -> LockMap {
+    pub(crate) fn new() -> LockMap {
         LockMap {
             locks: RwLock::new(HashMap::new()),
         }
@@ -73,7 +73,7 @@ impl LockMap {
     ///
     /// # Panics
     /// Panics if the procedure acquires the lock recursively.
-    async fn acquire_lock(&self, key: &str, meta: ProcedureMetaRef) {
+    pub(crate) async fn acquire_lock(&self, key: &str, meta: ProcedureMetaRef) {
         assert!(!self.hold_lock(key, meta.id));
 
         {
@@ -88,7 +88,7 @@ impl LockMap {
                 // expect that a procedure should not wait for two lock simultaneously.
                 lock.waiters.push_back(meta.clone());
             } else {
-                locks.insert(key.to_string(), Lock::from_owner(meta));
+                let _ = locks.insert(key.to_string(), Lock::from_owner(meta));
 
                 return;
             }
@@ -101,7 +101,7 @@ impl LockMap {
     }
 
     /// Release lock by `key`.
-    fn release_lock(&self, key: &str, procedure_id: ProcedureId) {
+    pub(crate) fn release_lock(&self, key: &str, procedure_id: ProcedureId) {
         let mut locks = self.locks.write().unwrap();
         if let Some(lock) = locks.get_mut(key) {
             if lock.owner.id != procedure_id {
@@ -111,7 +111,7 @@ impl LockMap {
 
             if !lock.switch_owner() {
                 // No body waits for this lock, we can remove the lock entry.
-                locks.remove(key);
+                let _ = locks.remove(key);
             }
         }
     }
@@ -142,11 +142,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::local;
+    use crate::local::test_util;
 
     #[test]
     fn test_lock_no_waiter() {
-        let meta = Arc::new(local::procedure_meta_for_test());
+        let meta = Arc::new(test_util::procedure_meta_for_test());
         let mut lock = Lock::from_owner(meta);
 
         assert!(!lock.switch_owner());
@@ -154,10 +154,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_with_waiter() {
-        let owner = Arc::new(local::procedure_meta_for_test());
+        let owner = Arc::new(test_util::procedure_meta_for_test());
         let mut lock = Lock::from_owner(owner);
 
-        let waiter = Arc::new(local::procedure_meta_for_test());
+        let waiter = Arc::new(test_util::procedure_meta_for_test());
         lock.waiters.push_back(waiter.clone());
 
         assert!(lock.switch_owner());
@@ -171,11 +171,11 @@ mod tests {
     async fn test_lock_map() {
         let key = "hello";
 
-        let owner = Arc::new(local::procedure_meta_for_test());
+        let owner = Arc::new(test_util::procedure_meta_for_test());
         let lock_map = Arc::new(LockMap::new());
         lock_map.acquire_lock(key, owner.clone()).await;
 
-        let waiter = Arc::new(local::procedure_meta_for_test());
+        let waiter = Arc::new(test_util::procedure_meta_for_test());
         let waiter_id = waiter.id;
 
         // Waiter release the lock, this should not take effect.

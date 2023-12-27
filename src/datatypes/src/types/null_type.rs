@@ -22,7 +22,7 @@ use crate::type_id::LogicalTypeId;
 use crate::value::Value;
 use crate::vectors::{MutableVector, NullVectorBuilder};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NullType;
 
 impl NullType {
@@ -32,8 +32,8 @@ impl NullType {
 }
 
 impl DataType for NullType {
-    fn name(&self) -> &str {
-        "Null"
+    fn name(&self) -> String {
+        "Null".to_string()
     }
 
     fn logical_type_id(&self) -> LogicalTypeId {
@@ -52,7 +52,8 @@ impl DataType for NullType {
         Box::<NullVectorBuilder>::default()
     }
 
-    fn is_timestamp_compatible(&self) -> bool {
-        false
+    // Unconditional cast other type to Value::Null
+    fn try_cast(&self, _from: Value) -> Option<Value> {
+        Some(Value::Null)
     }
 }

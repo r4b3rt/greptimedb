@@ -13,16 +13,19 @@
 // limitations under the License.
 
 use std::sync::Arc;
-mod from_unixtime;
+mod greatest;
+mod to_unixtime;
 
-use from_unixtime::FromUnixtimeFunction;
+use greatest::GreatestFunction;
+use to_unixtime::ToUnixtimeFunction;
 
-use crate::scalars::function_registry::FunctionRegistry;
+use crate::function_registry::FunctionRegistry;
 
 pub(crate) struct TimestampFunction;
 
 impl TimestampFunction {
     pub fn register(registry: &FunctionRegistry) {
-        registry.register(Arc::new(FromUnixtimeFunction::default()));
+        registry.register(Arc::new(ToUnixtimeFunction));
+        registry.register(Arc::new(GreatestFunction));
     }
 }

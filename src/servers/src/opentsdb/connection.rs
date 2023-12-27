@@ -100,7 +100,8 @@ impl<S: AsyncWrite + AsyncRead + Unpin> Connection<S> {
             .write_all(line.as_bytes())
             .await
             .context(error::InternalIoSnafu)?;
-        self.stream
+        let _ = self
+            .stream
             .write(b"\r\n")
             .await
             .context(error::InternalIoSnafu)?;
@@ -115,6 +116,7 @@ mod tests {
     use std::io::Write;
 
     use bytes::BufMut;
+    use common_error::ext::ErrorExt;
     use tokio_test::io::Builder;
 
     use super::*;
@@ -185,10 +187,8 @@ mod tests {
         buffer.writer().write_all(b"Hello Wor\xffld.\r\n").unwrap();
         let result = conn.parse_line();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid OpenTSDB line, source: invalid utf-8 sequence"));
+        let err = result.unwrap_err().output_msg();
+        assert!(err.contains("invalid utf-8 sequence"));
     }
 
     #[tokio::test]
@@ -198,7 +198,8 @@ mod tests {
             .write(b"\r\n")
             .build();
         let mut conn = Connection::new(mock);
-        let result = conn.write_line("An OpenTSDB error.".to_string()).await;
-        assert!(result.is_ok());
+        conn.write_line("An OpenTSDB error.".to_string())
+            .await
+            .unwrap();
     }
 }

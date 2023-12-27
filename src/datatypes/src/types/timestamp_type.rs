@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::FromStr;
+
 use arrow::datatypes::{
     DataType as ArrowDataType, TimeUnit as ArrowTimeUnit,
     TimestampMicrosecondType as ArrowTimestampMicrosecondType,
@@ -28,6 +30,7 @@ use snafu::OptionExt;
 
 use crate::data_type::ConcreteDataType;
 use crate::error;
+use crate::error::InvalidTimestampPrecisionSnafu;
 use crate::prelude::{
     DataType, LogicalTypeId, MutableVector, ScalarVectorBuilder, Value, ValueRef, Vector,
 };
@@ -41,13 +44,37 @@ use crate::vectors::{
     TimestampNanosecondVectorBuilder, TimestampSecondVector, TimestampSecondVectorBuilder,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+const SECOND_VARIATION: u64 = 0;
+const MILLISECOND_VARIATION: u64 = 3;
+const MICROSECOND_VARIATION: u64 = 6;
+const NANOSECOND_VARIATION: u64 = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[enum_dispatch(DataType)]
 pub enum TimestampType {
     Second(TimestampSecondType),
     Millisecond(TimestampMillisecondType),
     Microsecond(TimestampMicrosecondType),
     Nanosecond(TimestampNanosecondType),
+}
+
+impl TryFrom<u64> for TimestampType {
+    type Error = error::Error;
+
+    /// Convert fractional timestamp precision to timestamp types. Supported precisions are:
+    /// - 0: second
+    /// - 3: millisecond
+    /// - 6: microsecond
+    /// - 9: nanosecond
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            SECOND_VARIATION => Ok(TimestampType::Second(TimestampSecondType)),
+            MILLISECOND_VARIATION => Ok(TimestampType::Millisecond(TimestampMillisecondType)),
+            MICROSECOND_VARIATION => Ok(TimestampType::Microsecond(TimestampMicrosecondType)),
+            NANOSECOND_VARIATION => Ok(TimestampType::Nanosecond(TimestampNanosecondType)),
+            _ => InvalidTimestampPrecisionSnafu { precision: value }.fail(),
+        }
+    }
 }
 
 impl TimestampType {
@@ -60,17 +87,30 @@ impl TimestampType {
             TimestampType::Nanosecond(_) => TimeUnit::Nanosecond,
         }
     }
+
+    pub fn create_timestamp(&self, val: i64) -> Timestamp {
+        Timestamp::new(val, self.unit())
+    }
+
+    pub fn precision(&self) -> u64 {
+        match self {
+            TimestampType::Second(_) => SECOND_VARIATION,
+            TimestampType::Millisecond(_) => MILLISECOND_VARIATION,
+            TimestampType::Microsecond(_) => MICROSECOND_VARIATION,
+            TimestampType::Nanosecond(_) => NANOSECOND_VARIATION,
+        }
+    }
 }
 
 macro_rules! impl_data_type_for_timestamp {
     ($unit: ident) => {
         paste! {
-            #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+            #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
             pub struct [<Timestamp $unit Type>];
 
             impl DataType for [<Timestamp $unit Type>] {
-                fn name(&self) -> &str {
-                    stringify!([<Timestamp $unit>])
+                fn name(&self) -> String {
+                    stringify!([<Timestamp $unit>]).to_string()
                 }
 
                 fn logical_type_id(&self) -> LogicalTypeId {
@@ -89,8 +129,15 @@ macro_rules! impl_data_type_for_timestamp {
                     Box::new([<Timestamp $unit Vector Builder>]::with_capacity(capacity))
                 }
 
-                fn is_timestamp_compatible(&self) -> bool {
-                    true
+                fn try_cast(&self, from: Value)-> Option<Value>{
+                    match from {
+                        Value::Timestamp(v) => v.convert_to(TimeUnit::$unit).map(Value::Timestamp),
+                        Value::String(v) => Timestamp::from_str(v.as_utf8()).map(Value::Timestamp).ok(),
+                        Value::Int64(v) => Some(Value::Timestamp(Timestamp::new(v, TimeUnit::$unit))),
+                        Value::DateTime(v) => Timestamp::new_second(v.val()).convert_to(TimeUnit::$unit).map(Value::Timestamp),
+                        Value::Date(v) => Timestamp::new_second(v.to_secs()).convert_to(TimeUnit::$unit).map(Value::Timestamp),
+                        _ => None
+                    }
                 }
             }
 
@@ -156,6 +203,8 @@ impl_data_type_for_timestamp!(Microsecond);
 
 #[cfg(test)]
 mod tests {
+    use common_time::{Date, DateTime};
+
     use super::*;
 
     #[test]
@@ -176,5 +225,53 @@ mod tests {
             TimeUnit::Nanosecond,
             TimestampType::Nanosecond(TimestampNanosecondType).unit()
         );
+    }
+
+    // $TZ doesn't take effort
+    #[test]
+    fn test_timestamp_cast() {
+        std::env::set_var("TZ", "Asia/Shanghai");
+        // String -> TimestampSecond
+        let s = Value::String("2021-01-01 01:02:03".to_string().into());
+        let ts = ConcreteDataType::timestamp_second_datatype()
+            .try_cast(s)
+            .unwrap();
+        // 1609462923 is 2021-01-01T01:02:03Z
+        assert_eq!(ts, Value::Timestamp(Timestamp::new_second(1609462923)));
+        // String cast failed
+        let s = Value::String("12345".to_string().into());
+        let ts = ConcreteDataType::timestamp_second_datatype().try_cast(s);
+        assert_eq!(ts, None);
+
+        let n = Value::Int64(1694589525);
+        // Int64 -> TimestampSecond
+        let ts = ConcreteDataType::timestamp_second_datatype()
+            .try_cast(n)
+            .unwrap();
+        assert_eq!(ts, Value::Timestamp(Timestamp::new_second(1694589525)));
+
+        // Datetime -> TimestampSecond
+        let dt = Value::DateTime(DateTime::from(1234567));
+        let ts = ConcreteDataType::timestamp_second_datatype()
+            .try_cast(dt)
+            .unwrap();
+        assert_eq!(ts, Value::Timestamp(Timestamp::new_second(1234567)));
+
+        // Date -> TimestampMillisecond
+        let d = Value::Date(Date::from_str("1970-01-01").unwrap());
+        let ts = ConcreteDataType::timestamp_millisecond_datatype()
+            .try_cast(d)
+            .unwrap();
+        assert_eq!(ts, Value::Timestamp(Timestamp::new_millisecond(0)));
+
+        // TimestampSecond -> TimestampMicrosecond
+        let second = Value::Timestamp(Timestamp::new_second(123));
+        let microsecond = ConcreteDataType::timestamp_microsecond_datatype()
+            .try_cast(second)
+            .unwrap();
+        assert_eq!(
+            microsecond,
+            Value::Timestamp(Timestamp::new_microsecond(123 * 1000000))
+        )
     }
 }

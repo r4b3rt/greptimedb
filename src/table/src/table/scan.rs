@@ -14,41 +14,60 @@
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use common_query::error as query_error;
 use common_query::error::Result as QueryResult;
 use common_query::physical_plan::{Partitioning, PhysicalPlan, PhysicalPlanRef};
-use common_recordbatch::SendableRecordBatchStream;
+use common_recordbatch::error::Result as RecordBatchResult;
+use common_recordbatch::{RecordBatch, RecordBatchStream, SendableRecordBatchStream};
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion_physical_expr::PhysicalSortExpr;
 use datatypes::schema::SchemaRef;
+use futures::{Stream, StreamExt};
 use snafu::OptionExt;
 
-pub struct SimpleTableScan {
+use crate::table::metrics::MemoryUsageMetrics;
+
+/// Adapt greptime's [SendableRecordBatchStream] to GreptimeDB's [PhysicalPlan].
+pub struct StreamScanAdapter {
     stream: Mutex<Option<SendableRecordBatchStream>>,
     schema: SchemaRef,
+    output_ordering: Option<Vec<PhysicalSortExpr>>,
+    metric: ExecutionPlanMetricsSet,
 }
 
-impl Debug for SimpleTableScan {
+impl Debug for StreamScanAdapter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SimpleTableScan")
+        f.debug_struct("StreamScanAdapter")
             .field("stream", &"<SendableRecordBatchStream>")
-            .field("schema", &self.schema)
+            .field("schema", &self.schema.arrow_schema().fields)
             .finish()
     }
 }
 
-impl SimpleTableScan {
+impl StreamScanAdapter {
     pub fn new(stream: SendableRecordBatchStream) -> Self {
         let schema = stream.schema();
+
         Self {
             stream: Mutex::new(Some(stream)),
             schema,
+            output_ordering: None,
+            metric: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub fn with_output_ordering(mut self, output_ordering: Vec<PhysicalSortExpr>) -> Self {
+        self.output_ordering = Some(output_ordering);
+        self
     }
 }
 
-impl PhysicalPlan for SimpleTableScan {
+impl PhysicalPlan for StreamScanAdapter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -61,21 +80,69 @@ impl PhysicalPlan for SimpleTableScan {
         Partitioning::UnknownPartitioning(1)
     }
 
+    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+        self.output_ordering.as_deref()
+    }
+
     fn children(&self) -> Vec<PhysicalPlanRef> {
         vec![]
     }
 
     fn with_new_children(&self, _children: Vec<PhysicalPlanRef>) -> QueryResult<PhysicalPlanRef> {
-        unimplemented!()
+        Ok(Arc::new(Self::new(
+            self.stream.lock().unwrap().take().unwrap(),
+        )))
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> QueryResult<SendableRecordBatchStream> {
         let mut stream = self.stream.lock().unwrap();
-        stream.take().context(query_error::ExecuteRepeatedlySnafu)
+        let stream = stream.take().context(query_error::ExecuteRepeatedlySnafu)?;
+        let mem_usage_metrics = MemoryUsageMetrics::new(&self.metric, partition);
+        Ok(Box::pin(StreamWithMetricWrapper {
+            stream,
+            metric: mem_usage_metrics,
+        }))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metric.clone_inner())
+    }
+}
+
+pub struct StreamWithMetricWrapper {
+    stream: SendableRecordBatchStream,
+    metric: MemoryUsageMetrics,
+}
+
+impl Stream for StreamWithMetricWrapper {
+    type Item = RecordBatchResult<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let poll = this.stream.poll_next_unpin(cx);
+        if let Poll::Ready(Some(Ok(record_batch))) = &poll {
+            let batch_mem_size = record_batch
+                .columns()
+                .iter()
+                .map(|vec_ref| vec_ref.memory_size())
+                .sum::<usize>();
+            // we don't record elapsed time here
+            // since it's calling storage api involving I/O ops
+            this.metric.record_mem_usage(batch_mem_size);
+            this.metric.record_output(record_batch.num_rows());
+        }
+
+        poll
+    }
+}
+
+impl RecordBatchStream for StreamWithMetricWrapper {
+    fn schema(&self) -> SchemaRef {
+        self.stream.schema()
     }
 }
 
@@ -100,12 +167,12 @@ mod test {
 
         let batch1 = RecordBatch::new(
             schema.clone(),
-            vec![Arc::new(Int32Vector::from_slice(&[1, 2])) as _],
+            vec![Arc::new(Int32Vector::from_slice([1, 2])) as _],
         )
         .unwrap();
         let batch2 = RecordBatch::new(
             schema.clone(),
-            vec![Arc::new(Int32Vector::from_slice(&[3, 4, 5])) as _],
+            vec![Arc::new(Int32Vector::from_slice([3, 4, 5])) as _],
         )
         .unwrap();
 
@@ -113,7 +180,7 @@ mod test {
             RecordBatches::try_new(schema.clone(), vec![batch1.clone(), batch2.clone()]).unwrap();
         let stream = recordbatches.as_stream();
 
-        let scan = SimpleTableScan::new(stream);
+        let scan = StreamScanAdapter::new(stream);
 
         assert_eq!(scan.schema(), schema);
 

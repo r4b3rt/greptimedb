@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::{alter_expr, AddColumn, AlterExpr, DropColumn};
+use common_query::AddColumnLocation;
 use sqlparser::ast::{ColumnDef, Ident, ObjectName, TableConstraint};
+use sqlparser_derive::{Visit, VisitMut};
 
-use crate::error::UnsupportedAlterTableStatementSnafu;
-use crate::statements::{sql_column_def_to_grpc_column_def, table_idents_to_full_name};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub struct AlterTable {
     table_name: ObjectName,
     alter_operation: AlterTableOperation,
@@ -41,56 +39,17 @@ impl AlterTable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub enum AlterTableOperation {
     /// `ADD <table_constraint>`
     AddConstraint(TableConstraint),
-    /// `ADD [ COLUMN ] <column_def>`
-    AddColumn { column_def: ColumnDef },
+    /// `ADD [ COLUMN ] <column_def> [location]`
+    AddColumn {
+        column_def: ColumnDef,
+        location: Option<AddColumnLocation>,
+    },
     /// `DROP COLUMN <name>`
     DropColumn { name: Ident },
     /// `RENAME <new_table_name>`
     RenameTable { new_table_name: String },
-}
-
-/// Convert `AlterTable` statement to `AlterExpr` for gRPC
-impl TryFrom<AlterTable> for AlterExpr {
-    type Error = crate::error::Error;
-
-    fn try_from(value: AlterTable) -> Result<Self, Self::Error> {
-        let (catalog_name, schema_name, table_name) = table_idents_to_full_name(&value.table_name)?;
-
-        let kind = match value.alter_operation {
-            AlterTableOperation::AddConstraint(_) => {
-                return UnsupportedAlterTableStatementSnafu {
-                    msg: "ADD CONSTRAINT not supported yet.",
-                }
-                .fail();
-            }
-            AlterTableOperation::AddColumn { column_def } => {
-                alter_expr::Kind::AddColumns(api::v1::AddColumns {
-                    add_columns: vec![AddColumn {
-                        column_def: Some(sql_column_def_to_grpc_column_def(column_def)?),
-                        is_key: false,
-                    }],
-                })
-            }
-            AlterTableOperation::DropColumn { name } => {
-                alter_expr::Kind::DropColumns(api::v1::DropColumns {
-                    drop_columns: vec![DropColumn { name: name.value }],
-                })
-            }
-            AlterTableOperation::RenameTable { new_table_name } => {
-                alter_expr::Kind::RenameTable(api::v1::RenameTable { new_table_name })
-            }
-        };
-        let expr = AlterExpr {
-            catalog_name,
-            schema_name,
-            table_name,
-            kind: Some(kind),
-        };
-
-        Ok(expr)
-    }
 }

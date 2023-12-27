@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod adapter;
+mod metrics;
 pub mod numbers;
 pub mod scan;
 
@@ -21,14 +22,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_query::logical_plan::Expr;
-use common_query::physical_plan::PhysicalPlanRef;
+use common_recordbatch::SendableRecordBatchStream;
 use datatypes::schema::SchemaRef;
+use store_api::storage::ScanRequest;
 
-use crate::error::{Result, UnsupportedSnafu};
+use crate::error::Result;
 use crate::metadata::{FilterPushDownType, TableId, TableInfoRef, TableType};
-use crate::requests::{AlterTableRequest, DeleteRequest, InsertRequest};
-
-pub type AlterContext = anymap::Map<dyn Any + Send + Sync>;
 
 /// Table abstraction.
 #[async_trait]
@@ -44,54 +43,14 @@ pub trait Table: Send + Sync {
     fn table_info(&self) -> TableInfoRef;
 
     /// Get the type of this table for metadata/catalog purposes.
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
+    fn table_type(&self) -> TableType;
 
-    /// Insert values into table.
-    ///
-    /// Returns number of inserted rows.
-    async fn insert(&self, _request: InsertRequest) -> Result<usize> {
-        UnsupportedSnafu {
-            operation: "INSERT",
-        }
-        .fail()?
-    }
+    async fn scan_to_stream(&self, request: ScanRequest) -> Result<SendableRecordBatchStream>;
 
-    /// Scan the table and returns a SendableRecordBatchStream.
-    async fn scan(
-        &self,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        // limit can be used to reduce the amount scanned
-        // from the datasource as a performance optimization.
-        // If set, it contains the amount of rows needed by the `LogicalPlan`,
-        // The datasource should return *at least* this number of rows if available.
-        limit: Option<usize>,
-    ) -> Result<PhysicalPlanRef>;
-
-    /// Tests whether the table provider can make use of a filter expression
+    /// Tests whether the table provider can make use of any or all filter expressions
     /// to optimise data retrieval.
-    fn supports_filter_pushdown(&self, _filter: &Expr) -> Result<FilterPushDownType> {
-        Ok(FilterPushDownType::Unsupported)
-    }
-
-    /// Alter table.
-    async fn alter(&self, _context: AlterContext, _request: &AlterTableRequest) -> Result<()> {
-        UnsupportedSnafu {
-            operation: "ALTER TABLE",
-        }
-        .fail()?
-    }
-
-    /// Delete rows in the table.
-    ///
-    /// Returns number of deleted rows.
-    async fn delete(&self, _request: DeleteRequest) -> Result<usize> {
-        UnsupportedSnafu {
-            operation: "DELETE",
-        }
-        .fail()?
+    fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<FilterPushDownType>> {
+        Ok(vec![FilterPushDownType::Unsupported; filters.len()])
     }
 }
 

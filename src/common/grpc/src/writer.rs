@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::fmt::Display;
 
-use api::v1::column::{SemanticType, Values};
-use api::v1::{Column, ColumnDataType};
+use api::helper::values_with_capacity;
+use api::v1::{Column, ColumnDataType, ColumnDataTypeExtension, SemanticType};
 use common_base::BitVec;
+use common_time::timestamp::TimeUnit;
 use snafu::ensure;
 
 use crate::error::{Result, TypeMismatchSnafu};
+use crate::Error;
 
 type ColumnName = String;
 
@@ -47,6 +50,7 @@ impl LinesWriter {
             column_name,
             ColumnDataType::TimestampMillisecond,
             SemanticType::Timestamp,
+            None,
         );
         ensure!(
             column.datatype == ColumnDataType::TimestampMillisecond as i32,
@@ -59,14 +63,15 @@ impl LinesWriter {
         // It is safe to use unwrap here, because values has been initialized in mut_column()
         let values = column.values.as_mut().unwrap();
         values
-            .ts_millisecond_values
+            .timestamp_millisecond_values
             .push(to_ms_ts(value.1, value.0));
         self.null_masks[idx].push(false);
         Ok(())
     }
 
     pub fn write_tag(&mut self, column_name: &str, value: &str) -> Result<()> {
-        let (idx, column) = self.mut_column(column_name, ColumnDataType::String, SemanticType::Tag);
+        let (idx, column) =
+            self.mut_column(column_name, ColumnDataType::String, SemanticType::Tag, None);
         ensure!(
             column.datatype == ColumnDataType::String as i32,
             TypeMismatchSnafu {
@@ -83,8 +88,12 @@ impl LinesWriter {
     }
 
     pub fn write_u64(&mut self, column_name: &str, value: u64) -> Result<()> {
-        let (idx, column) =
-            self.mut_column(column_name, ColumnDataType::Uint64, SemanticType::Field);
+        let (idx, column) = self.mut_column(
+            column_name,
+            ColumnDataType::Uint64,
+            SemanticType::Field,
+            None,
+        );
         ensure!(
             column.datatype == ColumnDataType::Uint64 as i32,
             TypeMismatchSnafu {
@@ -101,8 +110,12 @@ impl LinesWriter {
     }
 
     pub fn write_i64(&mut self, column_name: &str, value: i64) -> Result<()> {
-        let (idx, column) =
-            self.mut_column(column_name, ColumnDataType::Int64, SemanticType::Field);
+        let (idx, column) = self.mut_column(
+            column_name,
+            ColumnDataType::Int64,
+            SemanticType::Field,
+            None,
+        );
         ensure!(
             column.datatype == ColumnDataType::Int64 as i32,
             TypeMismatchSnafu {
@@ -119,8 +132,12 @@ impl LinesWriter {
     }
 
     pub fn write_f64(&mut self, column_name: &str, value: f64) -> Result<()> {
-        let (idx, column) =
-            self.mut_column(column_name, ColumnDataType::Float64, SemanticType::Field);
+        let (idx, column) = self.mut_column(
+            column_name,
+            ColumnDataType::Float64,
+            SemanticType::Field,
+            None,
+        );
         ensure!(
             column.datatype == ColumnDataType::Float64 as i32,
             TypeMismatchSnafu {
@@ -137,8 +154,12 @@ impl LinesWriter {
     }
 
     pub fn write_string(&mut self, column_name: &str, value: &str) -> Result<()> {
-        let (idx, column) =
-            self.mut_column(column_name, ColumnDataType::String, SemanticType::Field);
+        let (idx, column) = self.mut_column(
+            column_name,
+            ColumnDataType::String,
+            SemanticType::Field,
+            None,
+        );
         ensure!(
             column.datatype == ColumnDataType::String as i32,
             TypeMismatchSnafu {
@@ -155,8 +176,12 @@ impl LinesWriter {
     }
 
     pub fn write_bool(&mut self, column_name: &str, value: bool) -> Result<()> {
-        let (idx, column) =
-            self.mut_column(column_name, ColumnDataType::Boolean, SemanticType::Field);
+        let (idx, column) = self.mut_column(
+            column_name,
+            ColumnDataType::Boolean,
+            SemanticType::Field,
+            None,
+        );
         ensure!(
             column.datatype == ColumnDataType::Boolean as i32,
             TypeMismatchSnafu {
@@ -198,6 +223,7 @@ impl LinesWriter {
         column_name: &str,
         datatype: ColumnDataType,
         semantic_type: SemanticType,
+        datatype_extension: Option<ColumnDataTypeExtension>,
     ) -> (usize, &mut Column) {
         let column_names = &mut self.column_name_index;
         let column_idx = match column_names.get(column_name) {
@@ -212,11 +238,12 @@ impl LinesWriter {
                 batch.0.push(Column {
                     column_name: column_name.to_string(),
                     semantic_type: semantic_type.into(),
-                    values: Some(Values::with_capacity(datatype, to_insert)),
+                    values: Some(values_with_capacity(datatype, to_insert)),
                     datatype: datatype as i32,
                     null_mask: Vec::default(),
+                    datatype_extension,
                 });
-                column_names.insert(column_name.to_string(), new_idx);
+                let _ = column_names.insert(column_name.to_string(), new_idx);
                 new_idx
             }
         };
@@ -245,10 +272,40 @@ pub enum Precision {
     Hour,
 }
 
+impl Display for Precision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Precision::Nanosecond => write!(f, "Precision::Nanosecond"),
+            Precision::Microsecond => write!(f, "Precision::Microsecond"),
+            Precision::Millisecond => write!(f, "Precision::Millisecond"),
+            Precision::Second => write!(f, "Precision::Second"),
+            Precision::Minute => write!(f, "Precision::Minute"),
+            Precision::Hour => write!(f, "Precision::Hour"),
+        }
+    }
+}
+
+impl TryFrom<Precision> for TimeUnit {
+    type Error = Error;
+
+    fn try_from(precision: Precision) -> std::result::Result<Self, Self::Error> {
+        Ok(match precision {
+            Precision::Second => TimeUnit::Second,
+            Precision::Millisecond => TimeUnit::Millisecond,
+            Precision::Microsecond => TimeUnit::Microsecond,
+            Precision::Nanosecond => TimeUnit::Nanosecond,
+            _ => {
+                return Err(Error::NotSupported {
+                    feat: format!("convert {precision} into TimeUnit"),
+                })
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use api::v1::column::SemanticType;
-    use api::v1::ColumnDataType;
+    use api::v1::{ColumnDataType, SemanticType};
     use common_base::BitVec;
 
     use super::LinesWriter;
@@ -327,7 +384,7 @@ mod tests {
         assert_eq!(SemanticType::Timestamp as i32, column.semantic_type);
         assert_eq!(
             vec![101011000, 102011001, 103011002],
-            column.values.as_ref().unwrap().ts_millisecond_values
+            column.values.as_ref().unwrap().timestamp_millisecond_values
         );
         verify_null_mask(&column.null_mask, vec![false, false, false]);
 

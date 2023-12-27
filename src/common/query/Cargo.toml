@@ -5,17 +5,22 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+api.workspace = true
 async-trait.workspace = true
-common-error = { path = "../error" }
-common-recordbatch = { path = "../recordbatch" }
-common-time = { path = "../time" }
-datafusion.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-recordbatch.workspace = true
+common-time.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
-datatypes = { path = "../../datatypes" }
+datafusion.workspace = true
+datatypes.workspace = true
+serde.workspace = true
 snafu.workspace = true
-statrs = "0.15"
+sqlparser.workspace = true
+sqlparser_derive = "0.1"
+statrs = "0.16"
 
 [dev-dependencies]
-common-base = { path = "../base" }
+common-base.workspace = true
 tokio.workspace = true

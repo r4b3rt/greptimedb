@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayBuilder, ArrayData, ArrayIter, ArrayRef};
+use arrow::array::{Array, ArrayBuilder, ArrayIter, ArrayRef};
 use snafu::ResultExt;
 
 use crate::arrow_array::{BinaryArray, MutableBinaryArray};
@@ -35,16 +35,6 @@ pub struct BinaryVector {
 impl BinaryVector {
     pub(crate) fn as_arrow(&self) -> &dyn Array {
         &self.array
-    }
-
-    fn to_array_data(&self) -> ArrayData {
-        self.array.data().clone()
-    }
-
-    fn from_array_data(data: ArrayData) -> BinaryVector {
-        BinaryVector {
-            array: BinaryArray::from(data),
-        }
     }
 }
 
@@ -80,13 +70,11 @@ impl Vector for BinaryVector {
     }
 
     fn to_arrow_array(&self) -> ArrayRef {
-        let data = self.to_array_data();
-        Arc::new(BinaryArray::from(data))
+        Arc::new(self.array.clone())
     }
 
     fn to_boxed_arrow_array(&self) -> Box<dyn Array> {
-        let data = self.to_array_data();
-        Box::new(BinaryArray::from(data))
+        Box::new(self.array.clone())
     }
 
     fn validity(&self) -> Validity {
@@ -106,8 +94,8 @@ impl Vector for BinaryVector {
     }
 
     fn slice(&self, offset: usize, length: usize) -> VectorRef {
-        let data = self.array.data().slice(offset, length);
-        Arc::new(Self::from_array_data(data))
+        let array = self.array.slice(offset, length);
+        Arc::new(Self { array })
     }
 
     fn get(&self, index: usize) -> Value {
@@ -116,6 +104,14 @@ impl Vector for BinaryVector {
 
     fn get_ref(&self, index: usize) -> ValueRef {
         vectors::impl_get_ref_for_vector!(self.array, index)
+    }
+}
+
+impl From<Vec<Vec<u8>>> for BinaryVector {
+    fn from(data: Vec<Vec<u8>>) -> Self {
+        Self {
+            array: BinaryArray::from_iter_values(data),
+        }
     }
 }
 
@@ -163,7 +159,11 @@ impl MutableVector for BinaryVectorBuilder {
         Arc::new(self.finish())
     }
 
-    fn push_value_ref(&mut self, value: ValueRef) -> Result<()> {
+    fn to_vector_cloned(&self) -> VectorRef {
+        Arc::new(self.finish_cloned())
+    }
+
+    fn try_push_value_ref(&mut self, value: ValueRef) -> Result<()> {
         match value.as_binary()? {
             Some(v) => self.mutable_array.append_value(v),
             None => self.mutable_array.append_null(),
@@ -173,6 +173,10 @@ impl MutableVector for BinaryVectorBuilder {
 
     fn extend_slice_of(&mut self, vector: &dyn Vector, offset: usize, length: usize) -> Result<()> {
         vectors::impl_extend_for_builder!(self, vector, BinaryVector, offset, length)
+    }
+
+    fn push_null(&mut self) {
+        self.mutable_array.append_null()
     }
 }
 
@@ -195,6 +199,12 @@ impl ScalarVectorBuilder for BinaryVectorBuilder {
     fn finish(&mut self) -> Self::VectorType {
         BinaryVector {
             array: self.mutable_array.finish(),
+        }
+    }
+
+    fn finish_cloned(&self) -> Self::VectorType {
+        BinaryVector {
+            array: self.mutable_array.finish_cloned(),
         }
     }
 }
@@ -227,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_binary_vector_misc() {
-        let v = BinaryVector::from(BinaryArray::from_iter_values(&[
+        let v = BinaryVector::from(BinaryArray::from_iter_values([
             vec![1, 2, 3],
             vec![1, 2, 3],
         ]));
@@ -282,7 +292,7 @@ mod tests {
     #[test]
     fn test_from_arrow_array() {
         let arrow_array = BinaryArray::from_iter_values([vec![1, 2, 3], vec![1, 2, 3]]);
-        let original = BinaryArray::from(arrow_array.data().clone());
+        let original = BinaryArray::from(arrow_array.to_data());
         let vector = BinaryVector::from(arrow_array);
         assert_eq!(original, vector.array);
     }
@@ -336,18 +346,33 @@ mod tests {
     fn test_binary_vector_builder() {
         let input = BinaryVector::from_slice(&[b"world", b"one", b"two"]);
 
-        let mut builder = BinaryType::default().create_mutable_vector(3);
-        builder
-            .push_value_ref(ValueRef::Binary("hello".as_bytes()))
-            .unwrap();
-        assert!(builder.push_value_ref(ValueRef::Int32(123)).is_err());
+        let mut builder = BinaryType.create_mutable_vector(3);
+        builder.push_value_ref(ValueRef::Binary("hello".as_bytes()));
+        assert!(builder.try_push_value_ref(ValueRef::Int32(123)).is_err());
         builder.extend_slice_of(&input, 1, 2).unwrap();
         assert!(builder
-            .extend_slice_of(&crate::vectors::Int32Vector::from_slice(&[13]), 0, 1)
+            .extend_slice_of(&crate::vectors::Int32Vector::from_slice([13]), 0, 1)
             .is_err());
         let vector = builder.to_vector();
 
         let expect: VectorRef = Arc::new(BinaryVector::from_slice(&[b"hello", b"one", b"two"]));
         assert_eq!(expect, vector);
+    }
+
+    #[test]
+    fn test_binary_vector_builder_finish_cloned() {
+        let mut builder = BinaryVectorBuilder::with_capacity(1024);
+        builder.push(Some(b"one"));
+        builder.push(Some(b"two"));
+        builder.push(Some(b"three"));
+        let vector = builder.finish_cloned();
+        assert_eq!(b"one", vector.get_data(0).unwrap());
+        assert_eq!(vector.len(), 3);
+        assert_eq!(builder.len(), 3);
+
+        builder.push(Some(b"four"));
+        let vector = builder.finish_cloned();
+        assert_eq!(b"four", vector.get_data(3).unwrap());
+        assert_eq!(builder.len(), 4);
     }
 }

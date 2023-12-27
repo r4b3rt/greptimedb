@@ -14,341 +14,260 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
-use store_api::storage::RegionId;
+use common_datasource::file_format::Format;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
+use servers::define_into_tonic_status;
+use snafu::{Location, Snafu};
+use store_api::storage::RegionNumber;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("{source}"))]
-    External {
-        #[snafu(backtrace)]
+    #[snafu(display("Failed to invalidate table cache"))]
+    InvalidateTableCache {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to open raft engine backend"))]
+    OpenRaftEngineBackend {
+        location: Location,
         source: BoxedError,
     },
 
-    #[snafu(display("Failed to request Datanode, source: {}", source))]
-    RequestDatanode {
-        #[snafu(backtrace)]
-        source: client::Error,
+    #[snafu(display("Failed to handle heartbeat response"))]
+    HandleHeartbeatResponse {
+        location: Location,
+        source: common_meta::error::Error,
     },
 
-    #[snafu(display("Runtime resource error, source: {}", source))]
+    #[snafu(display("External error"))]
+    External {
+        location: Location,
+        source: BoxedError,
+    },
+
+    #[snafu(display("Failed to query"))]
+    RequestQuery {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Runtime resource error"))]
     RuntimeResource {
-        #[snafu(backtrace)]
+        location: Location,
         source: common_runtime::error::Error,
     },
 
-    #[snafu(display("Failed to start server, source: {}", source))]
+    #[snafu(display("Failed to start server"))]
     StartServer {
-        #[snafu(backtrace)]
+        location: Location,
         source: servers::error::Error,
     },
 
-    #[snafu(display("Failed to parse address {}, source: {}", addr, source))]
-    ParseAddr {
-        addr: String,
-        source: std::net::AddrParseError,
+    #[snafu(display("Failed to shutdown server"))]
+    ShutdownServer {
+        location: Location,
+        source: servers::error::Error,
     },
 
-    #[snafu(display("Failed to parse SQL, source: {}", source))]
+    #[snafu(display("Failed to parse address {}", addr))]
+    ParseAddr {
+        addr: String,
+        #[snafu(source)]
+        error: std::net::AddrParseError,
+    },
+
+    #[snafu(display("Failed to parse SQL"))]
     ParseSql {
-        #[snafu(backtrace)]
+        location: Location,
         source: sql::error::Error,
     },
 
-    #[snafu(display("Column datatype error, source: {}", source))]
-    ColumnDataType {
-        #[snafu(backtrace)]
-        source: api::error::Error,
-    },
-
-    #[snafu(display(
-        "Invalid column proto definition, column: {}, source: {}",
-        column,
-        source
-    ))]
-    InvalidColumnDef {
-        column: String,
-        #[snafu(backtrace)]
-        source: api::error::Error,
-    },
-
-    #[snafu(display(
-        "Failed to convert column default constraint, column: {}, source: {}",
-        column_name,
-        source
-    ))]
-    ConvertColumnDefaultConstraint {
-        column_name: String,
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
-    },
+    #[snafu(display("Failed to convert vector to GRPC column, reason: {}", reason))]
+    VectorToGrpcColumn { reason: String, location: Location },
 
     #[snafu(display("Invalid SQL, error: {}", err_msg))]
-    InvalidSql {
-        err_msg: String,
-        backtrace: Backtrace,
-    },
+    InvalidSql { err_msg: String, location: Location },
 
-    #[snafu(display("Illegal Frontend state: {}", err_msg))]
-    IllegalFrontendState {
-        err_msg: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Incomplete GRPC result: {}", err_msg))]
-    IncompleteGrpcResult {
-        err_msg: String,
-        backtrace: Backtrace,
-    },
+    #[snafu(display("Incomplete GRPC request: {}", err_msg))]
+    IncompleteGrpcRequest { err_msg: String, location: Location },
 
     #[snafu(display("Failed to find Datanode by region: {:?}", region))]
     FindDatanode {
-        region: RegionId,
-        backtrace: Backtrace,
+        region: RegionNumber,
+        location: Location,
     },
 
     #[snafu(display("Invalid InsertRequest, reason: {}", reason))]
-    InvalidInsertRequest {
-        reason: String,
-        backtrace: Backtrace,
-    },
+    InvalidInsertRequest { reason: String, location: Location },
+
+    #[snafu(display("Invalid DeleteRequest, reason: {}", reason))]
+    InvalidDeleteRequest { reason: String, location: Location },
+
+    #[snafu(display("Invalid system table definition: {err_msg}"))]
+    InvalidSystemTableDef { err_msg: String, location: Location },
 
     #[snafu(display("Table not found: {}", table_name))]
-    TableNotFound {
-        table_name: String,
-        backtrace: Backtrace,
-    },
+    TableNotFound { table_name: String },
 
-    #[snafu(display("Column {} not found in table {}", column_name, table_name))]
-    ColumnNotFound {
-        column_name: String,
-        table_name: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display(
-        "Columns and values number mismatch, columns: {}, values: {}",
-        columns,
-        values,
-    ))]
-    ColumnValuesNumberMismatch {
-        columns: usize,
-        values: usize,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Failed to join task, source: {}", source))]
-    JoinTask {
-        source: common_runtime::JoinError,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("General catalog error: {}", source))]
+    #[snafu(display("General catalog error"))]
     Catalog {
-        #[snafu(backtrace)]
+        location: Location,
         source: catalog::error::Error,
     },
 
-    #[snafu(display("Failed to serialize or deserialize catalog entry: {}", source))]
-    CatalogEntrySerde {
-        #[snafu(backtrace)]
-        source: common_catalog::error::Error,
-    },
-
-    #[snafu(display("Failed to start Meta client, source: {}", source))]
+    #[snafu(display("Failed to start Meta client"))]
     StartMetaClient {
-        #[snafu(backtrace)]
+        location: Location,
         source: meta_client::error::Error,
     },
 
-    #[snafu(display("Failed to request Meta, source: {}", source))]
-    RequestMeta {
-        #[snafu(backtrace)]
+    #[snafu(display("Failed to create heartbeat stream to Metasrv"))]
+    CreateMetaHeartbeatStream {
         source: meta_client::error::Error,
+        location: Location,
     },
 
-    #[snafu(display("Failed to create table route for table {}", table_name))]
-    CreateTableRoute {
-        table_name: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Failed to find table route for table {}", table_name))]
+    #[snafu(display("Failed to find table route for table id {}", table_id))]
     FindTableRoute {
-        table_name: String,
-        #[snafu(backtrace)]
+        table_id: u32,
+        location: Location,
         source: partition::error::Error,
     },
 
-    #[snafu(display("Failed to create AlterExpr from Alter statement, source: {}", source))]
-    AlterExprFromStmt {
-        #[snafu(backtrace)]
-        source: sql::error::Error,
-    },
+    #[snafu(display("Schema {} already exists", name))]
+    SchemaExists { name: String, location: Location },
 
-    #[snafu(display("Failed to build CreateExpr on insertion: {}", source))]
-    BuildCreateExprOnInsertion {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
-    },
-
-    #[snafu(display(
-        "Failed to convert GRPC InsertRequest to table InsertRequest, source: {}",
-        source
-    ))]
-    ToTableInsertRequest {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
-    },
-
-    #[snafu(display("Failed to find catalog by name: {}", catalog_name))]
-    CatalogNotFound {
-        catalog_name: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Failed to find schema, schema info: {}", schema_info))]
-    SchemaNotFound {
-        schema_info: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Table occurs error, source: {}", source))]
+    #[snafu(display("Table occurs error"))]
     Table {
-        #[snafu(backtrace)]
+        location: Location,
         source: table::error::Error,
     },
 
-    #[snafu(display("Failed to find region route for table {}", table_name))]
-    FindRegionRoute {
-        table_name: String,
-        backtrace: Backtrace,
-    },
+    #[snafu(display("Cannot find column by name: {}", msg))]
+    ColumnNotFound { msg: String, location: Location },
 
-    #[snafu(display(
-        "Failed to find leader peer for region {} in table {}",
-        region,
-        table_name
-    ))]
-    FindLeaderPeer {
-        region: u64,
-        table_name: String,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Cannot find primary key column by name: {}", msg))]
-    PrimaryKeyNotFound { msg: String, backtrace: Backtrace },
-
-    #[snafu(display("Failed to execute statement, source: {}", source))]
-    ExecuteStatement {
-        #[snafu(backtrace)]
+    #[snafu(display("Failed to plan statement"))]
+    PlanStatement {
+        location: Location,
         source: query::error::Error,
     },
 
-    #[snafu(display("Failed to build DataFusion logical plan, source: {}", source))]
-    BuildDfLogicalPlan {
-        source: datafusion_common::DataFusionError,
-        backtrace: Backtrace,
+    #[snafu(display("Failed to read table: {table_name}"))]
+    ReadTable {
+        table_name: String,
+        location: Location,
+        source: query::error::Error,
     },
 
-    #[snafu(display("{source}"))]
-    InvokeDatanode {
-        #[snafu(backtrace)]
-        source: datanode::error::Error,
+    #[snafu(display("Failed to execute logical plan"))]
+    ExecLogicalPlan {
+        location: Location,
+        source: query::error::Error,
     },
 
-    #[snafu(display("Missing meta_client_opts section in config"))]
-    MissingMetasrvOpts { backtrace: Backtrace },
-
-    #[snafu(display("Failed to convert AlterExpr to AlterRequest, source: {}", source))]
-    AlterExprToRequest {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
+    #[snafu(display("Operation to region server failed"))]
+    InvokeRegionServer {
+        location: Location,
+        source: servers::error::Error,
     },
 
     #[snafu(display("Failed to find leaders when altering table, table: {}", table))]
-    LeaderNotFound { table: String, backtrace: Backtrace },
-
-    #[snafu(display("Table already exists: `{}`", table))]
-    TableAlreadyExist { table: String, backtrace: Backtrace },
-
-    #[snafu(display("Failed to encode Substrait logical plan, source: {}", source))]
-    EncodeSubstraitLogicalPlan {
-        #[snafu(backtrace)]
-        source: substrait::error::Error,
-    },
+    LeaderNotFound { table: String, location: Location },
 
     #[snafu(display("Failed to found context value: {}", key))]
-    ContextValueNotFound { key: String, backtrace: Backtrace },
-
-    #[snafu(display(
-        "Failed to build table meta for table: {}, source: {}",
-        table_name,
-        source
-    ))]
-    BuildTableMeta {
-        table_name: String,
-        source: table::metadata::TableMetaBuilderError,
-        backtrace: Backtrace,
-    },
+    ContextValueNotFound { key: String, location: Location },
 
     #[snafu(display("Not supported: {}", feat))]
     NotSupported { feat: String },
 
-    #[snafu(display("Failed to find new columns on insertion: {}", source))]
-    FindNewColumnsOnInsertion {
-        #[snafu(backtrace)]
-        source: common_grpc_expr::error::Error,
+    #[snafu(display("SQL execution intercepted"))]
+    SqlExecIntercepted {
+        location: Location,
+        source: BoxedError,
     },
 
-    #[snafu(display(
-        "Failed to build default value, column: {}, source: {}",
-        column,
-        source
-    ))]
-    ColumnDefaultValue {
-        column: String,
-        #[snafu(backtrace)]
-        source: datatypes::error::Error,
+    // TODO(ruihang): merge all query execution error kinds
+    #[snafu(display("Failed to execute PromQL query {}", query))]
+    ExecutePromql {
+        query: String,
+        location: Location,
+        source: servers::error::Error,
     },
+
+    #[snafu(display("Failed to create logical plan for prometheus query"))]
+    PromStoreRemoteQueryPlan {
+        location: Location,
+        source: servers::error::Error,
+    },
+
+    #[snafu(display("Failed to describe schema for given statement"))]
+    DescribeStatement {
+        location: Location,
+        source: query::error::Error,
+    },
+
+    #[snafu(display("Illegal primary keys definition: {}", msg))]
+    IllegalPrimaryKeysDef { msg: String, location: Location },
+
+    #[snafu(display("Failed to start script manager"))]
+    StartScriptManager {
+        location: Location,
+        source: script::error::Error,
+    },
+
+    #[snafu(display("Failed to copy table: {}", table_name))]
+    CopyTable {
+        table_name: String,
+        location: Location,
+        source: table::error::Error,
+    },
+
+    #[snafu(display("Failed to insert value into table: {}", table_name))]
+    Insert {
+        table_name: String,
+        location: Location,
+        source: table::error::Error,
+    },
+
+    #[snafu(display("Unsupported format: {:?}", format))]
+    UnsupportedFormat { location: Location, format: Format },
+
+    #[snafu(display("Failed to pass permission check"))]
+    Permission {
+        source: auth::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Empty data: {}", msg))]
+    EmptyData { msg: String, location: Location },
 
     #[snafu(display(
         "No valid default value can be built automatically, column: {}",
         column,
     ))]
-    ColumnNoneDefaultValue {
-        column: String,
-        backtrace: Backtrace,
+    ColumnNoneDefaultValue { column: String, location: Location },
+
+    #[snafu(display("Invalid region request, reason: {}", reason))]
+    InvalidRegionRequest { reason: String },
+
+    #[snafu(display("Table operation error"))]
+    TableOperation {
+        source: operator::error::Error,
+        location: Location,
     },
 
-    #[snafu(display("SQL execution intercepted, source: {}", source))]
-    SqlExecIntercepted {
-        #[snafu(backtrace)]
-        source: BoxedError,
-    },
+    #[snafu(display("Invalid auth config"))]
+    IllegalAuthConfig { source: auth::error::Error },
 
-    #[snafu(display(
-        "Failed to deserialize partition in meta to partition def, source: {}",
-        source
-    ))]
-    DeserializePartition {
-        #[snafu(backtrace)]
-        source: partition::error::Error,
-    },
-
-    // TODO(ruihang): merge all query execution error kinds
-    #[snafu(display("failed to execute PromQL query {}, source: {}", query, source))]
-    ExecutePromql {
-        query: String,
-        #[snafu(backtrace)]
-        source: servers::error::Error,
-    },
-
-    #[snafu(display("Failed to describe schema for given statement, source: {}", source))]
-    DescribeStatement {
-        #[snafu(backtrace)]
-        source: query::error::Error,
+    #[snafu(display("Failed to serialize options to TOML"))]
+    TomlFormat {
+        #[snafu(source)]
+        error: toml::ser::Error,
     },
 }
 
@@ -357,82 +276,77 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::ParseAddr { .. }
+            Error::TomlFormat { .. }
+            | Error::ParseAddr { .. }
             | Error::InvalidSql { .. }
             | Error::InvalidInsertRequest { .. }
-            | Error::ColumnValuesNumberMismatch { .. } => StatusCode::InvalidArguments,
+            | Error::InvalidDeleteRequest { .. }
+            | Error::IllegalPrimaryKeysDef { .. }
+            | Error::SchemaExists { .. }
+            | Error::ColumnNotFound { .. }
+            | Error::UnsupportedFormat { .. }
+            | Error::IllegalAuthConfig { .. }
+            | Error::EmptyData { .. }
+            | Error::ColumnNoneDefaultValue { .. }
+            | Error::IncompleteGrpcRequest { .. } => StatusCode::InvalidArguments,
 
             Error::NotSupported { .. } => StatusCode::Unsupported,
 
+            Error::Permission { source, .. } => source.status_code(),
+
+            Error::DescribeStatement { source, .. } => source.status_code(),
+
+            Error::HandleHeartbeatResponse { source, .. } => source.status_code(),
+
             Error::RuntimeResource { source, .. } => source.status_code(),
-            Error::ExecutePromql { source, .. } => source.status_code(),
+            Error::PromStoreRemoteQueryPlan { source, .. }
+            | Error::ExecutePromql { source, .. } => source.status_code(),
 
             Error::SqlExecIntercepted { source, .. } => source.status_code(),
             Error::StartServer { source, .. } => source.status_code(),
+            Error::ShutdownServer { source, .. } => source.status_code(),
 
-            Error::ParseSql { source } | Error::AlterExprFromStmt { source } => {
-                source.status_code()
-            }
+            Error::ParseSql { source, .. } => source.status_code(),
 
-            Error::Table { source } => source.status_code(),
+            Error::InvalidateTableCache { source, .. } => source.status_code(),
 
-            Error::ConvertColumnDefaultConstraint { source, .. } => source.status_code(),
+            Error::Table { source, .. }
+            | Error::CopyTable { source, .. }
+            | Error::Insert { source, .. } => source.status_code(),
 
-            Error::RequestDatanode { source } => source.status_code(),
+            Error::OpenRaftEngineBackend { .. } => StatusCode::StorageUnavailable,
 
-            Error::ColumnDataType { source } | Error::InvalidColumnDef { source, .. } => {
-                source.status_code()
-            }
+            Error::RequestQuery { source, .. } => source.status_code(),
 
             Error::FindDatanode { .. }
-            | Error::CreateTableRoute { .. }
-            | Error::FindRegionRoute { .. }
-            | Error::FindLeaderPeer { .. }
-            | Error::BuildDfLogicalPlan { .. }
-            | Error::BuildTableMeta { .. } => StatusCode::Internal,
+            | Error::VectorToGrpcColumn { .. }
+            | Error::InvalidRegionRequest { .. } => StatusCode::Internal,
 
-            Error::IllegalFrontendState { .. }
-            | Error::IncompleteGrpcResult { .. }
-            | Error::ContextValueNotFound { .. } => StatusCode::Unexpected,
+            Error::ContextValueNotFound { .. } | Error::InvalidSystemTableDef { .. } => {
+                StatusCode::Unexpected
+            }
 
             Error::TableNotFound { .. } => StatusCode::TableNotFound,
-            Error::ColumnNotFound { .. } => StatusCode::TableColumnNotFound,
 
-            Error::JoinTask { .. } => StatusCode::Unexpected,
             Error::Catalog { source, .. } => source.status_code(),
-            Error::CatalogEntrySerde { source, .. } => source.status_code(),
 
-            Error::StartMetaClient { source } | Error::RequestMeta { source } => {
-                source.status_code()
-            }
-            Error::SchemaNotFound { .. } => StatusCode::InvalidArguments,
-            Error::CatalogNotFound { .. } => StatusCode::InvalidArguments,
+            Error::StartMetaClient { source, .. }
+            | Error::CreateMetaHeartbeatStream { source, .. } => source.status_code(),
 
-            Error::BuildCreateExprOnInsertion { source }
-            | Error::ToTableInsertRequest { source }
-            | Error::FindNewColumnsOnInsertion { source } => source.status_code(),
+            Error::PlanStatement { source, .. }
+            | Error::ReadTable { source, .. }
+            | Error::ExecLogicalPlan { source, .. } => source.status_code(),
 
-            Error::PrimaryKeyNotFound { .. } => StatusCode::InvalidArguments,
-            Error::ExecuteStatement { source, .. } | Error::DescribeStatement { source } => {
-                source.status_code()
-            }
-            Error::MissingMetasrvOpts { .. } => StatusCode::InvalidArguments,
-            Error::AlterExprToRequest { source, .. } => source.status_code(),
             Error::LeaderNotFound { .. } => StatusCode::StorageUnavailable,
-            Error::TableAlreadyExist { .. } => StatusCode::TableAlreadyExists,
-            Error::EncodeSubstraitLogicalPlan { source } => source.status_code(),
-            Error::InvokeDatanode { source } => source.status_code(),
-            Error::ColumnDefaultValue { source, .. } => source.status_code(),
-            Error::ColumnNoneDefaultValue { .. } => StatusCode::InvalidArguments,
-            Error::External { source } => source.status_code(),
-            Error::DeserializePartition { source, .. } | Error::FindTableRoute { source, .. } => {
-                source.status_code()
-            }
-        }
-    }
+            Error::InvokeRegionServer { source, .. } => source.status_code(),
 
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
+            Error::External { source, .. } => source.status_code(),
+            Error::FindTableRoute { source, .. } => source.status_code(),
+
+            Error::StartScriptManager { source, .. } => source.status_code(),
+
+            Error::TableOperation { source, .. } => source.status_code(),
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -440,8 +354,13 @@ impl ErrorExt for Error {
     }
 }
 
-impl From<Error> for tonic::Status {
-    fn from(err: Error) -> Self {
-        tonic::Status::new(tonic::Code::Internal, err.to_string())
+define_into_tonic_status!(Error);
+
+impl From<operator::error::Error> for Error {
+    fn from(e: operator::error::Error) -> Error {
+        Error::TableOperation {
+            source: e,
+            location: Location::default(),
+        }
     }
 }

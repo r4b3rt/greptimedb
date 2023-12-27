@@ -15,11 +15,12 @@
 use std::fmt::Display;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Float64Array, Int64Array};
+use datafusion::arrow::array::{Float64Array, TimestampMillisecondArray};
+use datafusion::arrow::datatypes::TimeUnit;
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::{ScalarUDF, Signature, TypeSignature, Volatility};
 use datafusion::physical_plan::ColumnarValue;
-use datatypes::arrow::array::{Array, PrimitiveArray};
+use datatypes::arrow::array::Array;
 use datatypes::arrow::datatypes::DataType;
 
 use crate::error;
@@ -27,7 +28,7 @@ use crate::functions::extract_array;
 use crate::range_array::RangeArray;
 
 /// The `funcIdelta` in Promql,
-/// from https://github.com/prometheus/prometheus/blob/6bdecf377cea8e856509914f35234e948c4fcb80/promql/functions.go#L235
+/// from <https://github.com/prometheus/prometheus/blob/6bdecf377cea8e856509914f35234e948c4fcb80/promql/functions.go#L235>
 #[derive(Debug)]
 pub struct IDelta<const IS_RATE: bool> {}
 
@@ -55,7 +56,7 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
     // time index column and value column
     fn input_type() -> Vec<DataType> {
         vec![
-            RangeArray::convert_data_type(DataType::Int64),
+            RangeArray::convert_data_type(DataType::Timestamp(TimeUnit::Millisecond, None)),
             RangeArray::convert_data_type(DataType::Float64),
         ]
     }
@@ -70,8 +71,8 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
         let ts_array = extract_array(&input[0])?;
         let value_array = extract_array(&input[1])?;
 
-        let ts_range: RangeArray = RangeArray::try_new(ts_array.data().clone().into())?;
-        let value_range: RangeArray = RangeArray::try_new(value_array.data().clone().into())?;
+        let ts_range: RangeArray = RangeArray::try_new(ts_array.to_data().into())?;
+        let value_range: RangeArray = RangeArray::try_new(value_array.to_data().into())?;
         error::ensure(
             ts_range.len() == value_range.len(),
             DataFusionError::Execution(format!(
@@ -82,9 +83,9 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
             )),
         )?;
         error::ensure(
-            ts_range.value_type() == DataType::Int64,
+            ts_range.value_type() == DataType::Timestamp(TimeUnit::Millisecond, None),
             DataFusionError::Execution(format!(
-                "{}: expect Int64 as time index array's type, found {}",
+                "{}: expect TimestampMillisecond as time index array's type, found {}",
                 Self::name(),
                 ts_range.value_type()
             )),
@@ -92,7 +93,7 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
         error::ensure(
             value_range.value_type() == DataType::Float64,
             DataFusionError::Execution(format!(
-                "{}: expect Int64 as time index array's type, found {}",
+                "{}: expect Float64 as value array's type, found {}",
                 Self::name(),
                 value_range.value_type()
             )),
@@ -105,7 +106,7 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
             let timestamps = ts_range.get(index).unwrap();
             let timestamps = timestamps
                 .as_any()
-                .downcast_ref::<Int64Array>()
+                .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap()
                 .values();
 
@@ -127,13 +128,13 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
 
             let len = timestamps.len();
             if len < 2 {
-                result_array.push(0.0);
+                result_array.push(None);
                 continue;
             }
 
             // if is delta
             if !IS_RATE {
-                result_array.push(values[len - 1] - values[len - 2]);
+                result_array.push(Some(values[len - 1] - values[len - 2]));
                 continue;
             }
 
@@ -150,10 +151,10 @@ impl<const IS_RATE: bool> IDelta<IS_RATE> {
                 last_value - prev_value
             };
 
-            result_array.push(result_value / sampled_interval as f64);
+            result_array.push(Some(result_value / sampled_interval as f64));
         }
 
-        let result = ColumnarValue::Array(Arc::new(PrimitiveArray::from_iter(result_array)));
+        let result = ColumnarValue::Array(Arc::new(Float64Array::from_iter(result_array)));
         Ok(result)
     }
 }
@@ -168,42 +169,15 @@ impl<const IS_RATE: bool> Display for IDelta<IS_RATE> {
 mod test {
 
     use super::*;
-
-    fn idelta_runner(input_ts: RangeArray, input_value: RangeArray, expected: Vec<f64>) {
-        let input = vec![
-            ColumnarValue::Array(Arc::new(input_ts.into_dict())),
-            ColumnarValue::Array(Arc::new(input_value.into_dict())),
-        ];
-        let output = extract_array(&IDelta::<false>::calc(&input).unwrap())
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(output, expected);
-    }
-
-    fn irate_runner(input_ts: RangeArray, input_value: RangeArray, expected: Vec<f64>) {
-        let input = vec![
-            ColumnarValue::Array(Arc::new(input_ts.into_dict())),
-            ColumnarValue::Array(Arc::new(input_value.into_dict())),
-        ];
-        let output = extract_array(&IDelta::<true>::calc(&input).unwrap())
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(output, expected);
-    }
+    use crate::functions::test_util::simple_range_udf_runner;
 
     #[test]
     fn basic_idelta_and_irate() {
-        let ts_array = Arc::new(Int64Array::from_iter([
-            1000, 3000, 5000, 7000, 9000, 11000, 13000, 15000, 17000,
-        ]));
+        let ts_array = Arc::new(TimestampMillisecondArray::from_iter(
+            [1000i64, 3000, 5000, 7000, 9000, 11000, 13000, 15000, 17000]
+                .into_iter()
+                .map(Some),
+        ));
         let ts_ranges = [(0, 2), (0, 5), (1, 1), (3, 3), (8, 1), (9, 0)];
 
         let values_array = Arc::new(Float64Array::from_iter([
@@ -211,21 +185,26 @@ mod test {
         ]));
         let values_ranges = [(0, 2), (0, 5), (1, 1), (3, 3), (8, 1), (9, 0)];
 
+        // test idelta
         let ts_range_array = RangeArray::from_ranges(ts_array.clone(), ts_ranges).unwrap();
         let value_range_array =
             RangeArray::from_ranges(values_array.clone(), values_ranges).unwrap();
-        idelta_runner(
+        simple_range_udf_runner(
+            IDelta::<false>::scalar_udf(),
             ts_range_array,
             value_range_array,
-            vec![1.0, -5.0, 0.0, 6.0, 0.0, 0.0],
+            vec![Some(1.0), Some(-5.0), None, Some(6.0), None, None],
         );
 
+        // test irate
         let ts_range_array = RangeArray::from_ranges(ts_array, ts_ranges).unwrap();
         let value_range_array = RangeArray::from_ranges(values_array, values_ranges).unwrap();
-        irate_runner(
+        simple_range_udf_runner(
+            IDelta::<true>::scalar_udf(),
             ts_range_array,
             value_range_array,
-            vec![0.5, 0.0, 0.0, 3.0, 0.0, 0.0],
+            // the second point represent counter reset
+            vec![Some(0.5), Some(0.0), None, Some(3.0), None, None],
         );
     }
 }

@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::{ColumnDataType, ColumnDef, CreateTableExpr, TableId};
+use api::v1::{ColumnDataType, ColumnDef, CreateTableExpr, SemanticType, TableId};
 use client::{Client, Database};
-use prost_09::Message;
-use substrait_proto::protobuf::plan_rel::RelType as PlanRelType;
-use substrait_proto::protobuf::read_rel::{NamedTable, ReadType};
-use substrait_proto::protobuf::rel::RelType;
-use substrait_proto::protobuf::{PlanRel, ReadRel, Rel};
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE};
+use prost::Message;
+use substrait_proto::proto::plan_rel::RelType as PlanRelType;
+use substrait_proto::proto::read_rel::{NamedTable, ReadType};
+use substrait_proto::proto::rel::RelType;
+use substrait_proto::proto::{PlanRel, ReadRel, Rel};
 use tracing::{event, Level};
 
 fn main() {
@@ -40,21 +41,30 @@ async fn run() {
         column_defs: vec![
             ColumnDef {
                 name: "timestamp".to_string(),
-                datatype: ColumnDataType::TimestampMillisecond as i32,
+                data_type: ColumnDataType::TimestampMillisecond as i32,
                 is_nullable: false,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Timestamp as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "key".to_string(),
-                datatype: ColumnDataType::Uint64 as i32,
+                data_type: ColumnDataType::Uint64 as i32,
                 is_nullable: false,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Tag as i32,
+                comment: String::new(),
+                ..Default::default()
             },
             ColumnDef {
                 name: "value".to_string(),
-                datatype: ColumnDataType::Uint64 as i32,
+                data_type: ColumnDataType::Uint64 as i32,
                 is_nullable: false,
                 default_constraint: vec![],
+                semantic_type: SemanticType::Field as i32,
+                comment: String::new(),
+                ..Default::default()
             },
         ],
         time_index: "timestamp".to_string(),
@@ -62,10 +72,10 @@ async fn run() {
         create_if_not_exists: false,
         table_options: Default::default(),
         table_id: Some(TableId { id: 1024 }),
-        region_ids: vec![0],
+        engine: MITO_ENGINE.to_string(),
     };
 
-    let db = Database::with_client(client);
+    let db = Database::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, client);
     let result = db.create(create_table_expr).await.unwrap();
     event!(Level::INFO, "create table result: {:#?}", result);
 
@@ -88,12 +98,8 @@ fn mock_logical_plan() -> Vec<u8> {
     let read_type = ReadType::NamedTable(named_table);
 
     let read_rel = ReadRel {
-        common: None,
-        base_schema: None,
-        filter: None,
-        projection: None,
-        advanced_extension: None,
         read_type: Some(read_type),
+        ..Default::default()
     };
 
     let mut buf = vec![];

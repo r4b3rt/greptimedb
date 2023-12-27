@@ -14,23 +14,11 @@
 
 #![feature(assert_matches)]
 
-pub type Plugins = anymap::Map<dyn core::any::Any + Send + Sync>;
-
-mod catalog;
-mod datanode;
 pub mod error;
-mod expr_factory;
 pub mod frontend;
-pub mod grpc;
-pub mod influxdb;
+pub mod heartbeat;
 pub mod instance;
-pub mod mysql;
-pub mod opentsdb;
-pub mod postgres;
-pub mod prometheus;
-pub mod promql;
+pub(crate) mod metrics;
+mod script;
 mod server;
-mod sql;
-mod table;
-#[cfg(test)]
-mod tests;
+pub mod service_config;

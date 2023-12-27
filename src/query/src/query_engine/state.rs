@@ -17,28 +17,35 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use catalog::CatalogListRef;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use catalog::CatalogManagerRef;
+use common_base::Plugins;
 use common_function::scalars::aggregate::AggregateFunctionMetaRef;
-use common_query::physical_plan::{SessionContext, TaskContext};
+use common_query::physical_plan::SessionContext;
 use common_query::prelude::ScalarUdf;
-use datafusion::catalog::TableReference;
+use datafusion::catalog::MemoryCatalogList;
+use datafusion::dataframe::DataFrame;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::{QueryPlanner, SessionConfig, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::physical_plan::planner::DefaultPhysicalPlanner;
-use datafusion::physical_plan::udf::ScalarUDF;
-use datafusion::physical_plan::{ExecutionPlan, PhysicalPlanner};
-use datafusion_common::ScalarValue;
-use datafusion_expr::{LogicalPlan as DfLogicalPlan, TableSource};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
+use datafusion_expr::LogicalPlan as DfLogicalPlan;
+use datafusion_optimizer::analyzer::count_wildcard_rule::CountWildcardRule;
+use datafusion_optimizer::analyzer::{Analyzer, AnalyzerRule};
 use datafusion_optimizer::optimizer::Optimizer;
-use datafusion_sql::planner::ContextProvider;
-use datatypes::arrow::datatypes::DataType;
 use promql::extension_plan::PromExtensionPlanner;
-use session::context::QueryContextRef;
+use substrait::extension_serializer::ExtensionSerializer;
+use table::table::adapter::DfTableProviderAdapter;
+use table::TableRef;
 
-use crate::datafusion::DfCatalogListAdapter;
-use crate::optimizer::TypeConversionRule;
+use crate::dist_plan::{DistExtensionPlanner, DistPlannerAnalyzer};
+use crate::optimizer::order_hint::OrderHintRule;
+use crate::optimizer::string_normalization::StringNormalizationRule;
+use crate::optimizer::type_conversion::TypeConversionRule;
+use crate::query_engine::options::QueryOptions;
+use crate::range_select::planner::RangeSelectPlanner;
+use crate::region_query::RegionQueryHandlerRef;
+use crate::table_mutation::TableMutationHandlerRef;
 
 /// Query engine global state
 // TODO(yingwen): This QueryEngineState still relies on datafusion, maybe we can define a trait for it,
@@ -47,38 +54,68 @@ use crate::optimizer::TypeConversionRule;
 #[derive(Clone)]
 pub struct QueryEngineState {
     df_context: SessionContext,
-    catalog_list: CatalogListRef,
+    catalog_manager: CatalogManagerRef,
+    table_mutation_handler: Option<TableMutationHandlerRef>,
     aggregate_functions: Arc<RwLock<HashMap<String, AggregateFunctionMetaRef>>>,
+    plugins: Plugins,
 }
 
 impl fmt::Debug for QueryEngineState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO(dennis) better debug info
-        write!(f, "QueryEngineState: <datafusion context>")
+        f.debug_struct("QueryEngineState")
+            .field("state", &self.df_context.state())
+            .finish()
     }
 }
 
 impl QueryEngineState {
-    pub fn new(catalog_list: CatalogListRef) -> Self {
+    pub fn new(
+        catalog_list: CatalogManagerRef,
+        region_query_handler: Option<RegionQueryHandlerRef>,
+        table_mutation_handler: Option<TableMutationHandlerRef>,
+        with_dist_planner: bool,
+        plugins: Plugins,
+    ) -> Self {
         let runtime_env = Arc::new(RuntimeEnv::default());
-        let session_config = SessionConfig::new()
-            .with_default_catalog_and_schema(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME);
-        let mut optimizer = Optimizer::new();
+        let session_config = SessionConfig::new().with_create_default_catalog_and_schema(false);
         // Apply the type conversion rule first.
-        optimizer.rules.insert(0, Arc::new(TypeConversionRule {}));
+        let mut analyzer = Analyzer::new();
+        analyzer.rules.insert(0, Arc::new(TypeConversionRule));
+        analyzer.rules.insert(0, Arc::new(StringNormalizationRule));
+        Self::remove_analyzer_rule(&mut analyzer.rules, CountWildcardRule {}.name());
+        analyzer.rules.insert(0, Arc::new(CountWildcardRule {}));
+        if with_dist_planner {
+            analyzer.rules.push(Arc::new(DistPlannerAnalyzer));
+        }
+        let mut optimizer = Optimizer::new();
+        optimizer.rules.push(Arc::new(OrderHintRule));
 
-        let mut session_state = SessionState::with_config_rt(session_config, runtime_env);
-        session_state.optimizer = optimizer;
-        session_state.catalog_list = Arc::new(DfCatalogListAdapter::new(catalog_list.clone()));
-        session_state.query_planner = Arc::new(DfQueryPlanner::new());
+        let session_state = SessionState::new_with_config_rt_and_catalog_list(
+            session_config,
+            runtime_env,
+            Arc::new(MemoryCatalogList::default()), // pass a dummy catalog list
+        )
+        .with_serializer_registry(Arc::new(ExtensionSerializer))
+        .with_analyzer_rules(analyzer.rules)
+        .with_query_planner(Arc::new(DfQueryPlanner::new(
+            catalog_list.clone(),
+            region_query_handler,
+        )))
+        .with_optimizer_rules(optimizer.rules);
 
-        let df_context = SessionContext::with_state(session_state);
+        let df_context = SessionContext::new_with_state(session_state);
 
         Self {
             df_context,
-            catalog_list,
+            catalog_manager: catalog_list,
+            table_mutation_handler,
             aggregate_functions: Arc::new(RwLock::new(HashMap::new())),
+            plugins,
         }
+    }
+
+    fn remove_analyzer_rule(rules: &mut Vec<Arc<dyn AnalyzerRule + Send + Sync>>, name: &str) {
+        rules.retain(|rule| rule.name() != name);
     }
 
     /// Register a udf function
@@ -95,76 +132,51 @@ impl QueryEngineState {
             .cloned()
     }
 
+    /// Register an aggregate function.
+    ///
+    /// # Panics
+    /// Will panic if the function with same name is already registered.
+    ///
+    /// Panicking consideration: currently the aggregated functions are all statically registered,
+    /// user cannot define their own aggregate functions on the fly. So we can panic here. If that
+    /// invariant is broken in the future, we should return an error instead of panicking.
     pub fn register_aggregate_function(&self, func: AggregateFunctionMetaRef) {
-        // TODO(LFC): Return some error if there exists an aggregate function with the same name.
-        // Simply overwrite the old value for now.
-        self.aggregate_functions
+        let name = func.name();
+        let x = self
+            .aggregate_functions
             .write()
             .unwrap()
-            .insert(func.name(), func);
+            .insert(name.clone(), func);
+        assert!(
+            x.is_none(),
+            "Already registered aggregate function '{name}'"
+        );
     }
 
     #[inline]
-    pub fn catalog_list(&self) -> &CatalogListRef {
-        &self.catalog_list
+    pub fn catalog_manager(&self) -> &CatalogManagerRef {
+        &self.catalog_manager
     }
 
     #[inline]
-    pub(crate) fn task_ctx(&self) -> Arc<TaskContext> {
-        self.df_context.task_ctx()
+    pub fn table_mutation_handler(&self) -> Option<&TableMutationHandlerRef> {
+        self.table_mutation_handler.as_ref()
     }
 
-    pub(crate) fn get_table_provider(
-        &self,
-        query_ctx: QueryContextRef,
-        name: TableReference,
-    ) -> DfResult<Arc<dyn TableSource>> {
-        let state = self.df_context.state();
-        if let TableReference::Bare { table } = name {
-            let name = TableReference::Partial {
-                schema: &query_ctx.current_schema(),
-                table,
-            };
-            state.get_table_provider(name)
-        } else {
-            state.get_table_provider(name)
-        }
+    pub(crate) fn disallow_cross_schema_query(&self) -> bool {
+        self.plugins
+            .map::<QueryOptions, _, _>(|x| x.disallow_cross_schema_query)
+            .unwrap_or(false)
     }
 
-    pub(crate) fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.df_context.state().get_function_meta(name)
+    pub(crate) fn session_state(&self) -> SessionState {
+        self.df_context.state()
     }
 
-    pub(crate) fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType> {
-        self.df_context.state().get_variable_type(variable_names)
-    }
-
-    pub(crate) fn get_config_option(&self, variable: &str) -> Option<ScalarValue> {
-        self.df_context.state().get_config_option(variable)
-    }
-
-    pub(crate) fn optimize(&self, plan: &DfLogicalPlan) -> DfResult<DfLogicalPlan> {
-        self.df_context.optimize(plan)
-    }
-
-    pub(crate) async fn create_physical_plan(
-        &self,
-        logical_plan: &DfLogicalPlan,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        self.df_context.create_physical_plan(logical_plan).await
-    }
-
-    pub(crate) fn optimize_physical_plan(
-        &self,
-        mut plan: Arc<dyn ExecutionPlan>,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let state = self.df_context.state();
-        let config = &state.config;
-        for optimizer in &state.physical_optimizers {
-            plan = optimizer.optimize(plan, config)?;
-        }
-
-        Ok(plan)
+    /// Create a DataFrame for a table
+    pub fn read_table(&self, table: TableRef) -> DfResult<DataFrame> {
+        self.df_context
+            .read_table(Arc::new(DfTableProviderAdapter::new(table)))
     }
 }
 
@@ -186,11 +198,20 @@ impl QueryPlanner for DfQueryPlanner {
 }
 
 impl DfQueryPlanner {
-    fn new() -> Self {
+    fn new(
+        catalog_manager: CatalogManagerRef,
+        region_query_handler: Option<RegionQueryHandlerRef>,
+    ) -> Self {
+        let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+            vec![Arc::new(PromExtensionPlanner), Arc::new(RangeSelectPlanner)];
+        if let Some(region_query_handler) = region_query_handler {
+            planners.push(Arc::new(DistExtensionPlanner::new(
+                catalog_manager,
+                region_query_handler,
+            )));
+        }
         Self {
-            physical_planner: DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
-                PromExtensionPlanner {},
-            )]),
+            physical_planner: DefaultPhysicalPlanner::with_extension_planners(planners),
         }
     }
 }

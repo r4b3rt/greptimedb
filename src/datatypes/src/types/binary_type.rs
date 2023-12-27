@@ -24,7 +24,7 @@ use crate::type_id::LogicalTypeId;
 use crate::value::Value;
 use crate::vectors::{BinaryVectorBuilder, MutableVector};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BinaryType;
 
 impl BinaryType {
@@ -34,8 +34,8 @@ impl BinaryType {
 }
 
 impl DataType for BinaryType {
-    fn name(&self) -> &str {
-        "Binary"
+    fn name(&self) -> String {
+        "Binary".to_string()
     }
 
     fn logical_type_id(&self) -> LogicalTypeId {
@@ -54,7 +54,11 @@ impl DataType for BinaryType {
         Box::new(BinaryVectorBuilder::with_capacity(capacity))
     }
 
-    fn is_timestamp_compatible(&self) -> bool {
-        false
+    fn try_cast(&self, from: Value) -> Option<Value> {
+        match from {
+            Value::Binary(v) => Some(Value::Binary(v)),
+            Value::String(v) => Some(Value::Binary(Bytes::from(v.as_utf8().as_bytes()))),
+            _ => None,
+        }
     }
 }

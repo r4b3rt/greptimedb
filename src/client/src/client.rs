@@ -14,6 +14,11 @@
 
 use std::sync::Arc;
 
+use api::v1::greptime_database_client::GreptimeDatabaseClient;
+use api::v1::health_check_client::HealthCheckClient;
+use api::v1::prometheus_gateway_client::PrometheusGatewayClient;
+use api::v1::region::region_client::RegionClient as PbRegionClient;
+use api::v1::HealthCheckRequest;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use common_grpc::channel_manager::ChannelManager;
 use parking_lot::RwLock;
@@ -22,6 +27,10 @@ use tonic::transport::Channel;
 
 use crate::load_balance::{LoadBalance, Loadbalancer};
 use crate::{error, Result};
+
+pub(crate) struct DatabaseClient {
+    pub(crate) inner: GreptimeDatabaseClient<Channel>,
+}
 
 pub(crate) struct FlightClient {
     addr: String,
@@ -74,11 +83,6 @@ impl Client {
         Default::default()
     }
 
-    pub fn with_manager(channel_manager: ChannelManager) -> Self {
-        let inner = Arc::new(Inner::with_manager(channel_manager));
-        Self { inner }
-    }
-
     pub fn with_urls<U, A>(urls: A) -> Self
     where
         U: AsRef<str>,
@@ -118,7 +122,7 @@ impl Client {
         self.inner.set_peers(urls);
     }
 
-    pub(crate) fn make_client(&self) -> Result<FlightClient> {
+    fn find_channel(&self) -> Result<(String, Channel)> {
         let addr = self
             .inner
             .get_peer()
@@ -131,10 +135,61 @@ impl Client {
             .channel_manager
             .get(&addr)
             .context(error::CreateChannelSnafu { addr: &addr })?;
+        Ok((addr, channel))
+    }
+
+    fn max_grpc_recv_message_size(&self) -> usize {
+        self.inner
+            .channel_manager
+            .config()
+            .max_recv_message_size
+            .as_bytes() as usize
+    }
+
+    fn max_grpc_send_message_size(&self) -> usize {
+        self.inner
+            .channel_manager
+            .config()
+            .max_send_message_size
+            .as_bytes() as usize
+    }
+
+    pub(crate) fn make_flight_client(&self) -> Result<FlightClient> {
+        let (addr, channel) = self.find_channel()?;
         Ok(FlightClient {
             addr,
-            client: FlightServiceClient::new(channel),
+            client: FlightServiceClient::new(channel)
+                .max_decoding_message_size(self.max_grpc_recv_message_size())
+                .max_encoding_message_size(self.max_grpc_send_message_size()),
         })
+    }
+
+    pub(crate) fn make_database_client(&self) -> Result<DatabaseClient> {
+        let (_, channel) = self.find_channel()?;
+        Ok(DatabaseClient {
+            inner: GreptimeDatabaseClient::new(channel)
+                .max_decoding_message_size(self.max_grpc_recv_message_size())
+                .max_encoding_message_size(self.max_grpc_send_message_size()),
+        })
+    }
+
+    pub(crate) fn raw_region_client(&self) -> Result<PbRegionClient<Channel>> {
+        let (_, channel) = self.find_channel()?;
+        Ok(PbRegionClient::new(channel)
+            .max_decoding_message_size(self.max_grpc_recv_message_size())
+            .max_encoding_message_size(self.max_grpc_send_message_size()))
+    }
+
+    pub fn make_prometheus_gateway_client(&self) -> Result<PrometheusGatewayClient<Channel>> {
+        let (_, channel) = self.find_channel()?;
+        Ok(PrometheusGatewayClient::new(channel))
+    }
+
+    pub async fn health_check(&self) -> Result<()> {
+        let (_, channel) = self.find_channel()?;
+        let mut client = HealthCheckClient::new(channel);
+        let _ = client.health_check(HealthCheckRequest {}).await?;
+        Ok(())
     }
 }
 

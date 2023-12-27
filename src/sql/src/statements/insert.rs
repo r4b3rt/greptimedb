@@ -12,27 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use sqlparser::ast::{ObjectName, SetExpr, Statement, UnaryOperator, Values};
+use sqlparser::ast::{ObjectName, Query, SetExpr, Statement, UnaryOperator, Values};
 use sqlparser::parser::ParserError;
+use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::{Expr, Value};
-use crate::error::{self, Result};
-use crate::statements::table_idents_to_full_name;
+use crate::error::Result;
+use crate::statements::query::Query as GtQuery;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Visit, VisitMut)]
 pub struct Insert {
     // Can only be sqlparser::ast::Statement::Insert variant
     pub inner: Statement,
 }
 
-impl Insert {
-    pub fn full_table_name(&self) -> Result<(String, String, String)> {
-        match &self.inner {
-            Statement::Insert { table_name, .. } => table_idents_to_full_name(table_name),
-            _ => unreachable!(),
+macro_rules! parse_fail {
+    ($expr: expr) => {
+        return crate::error::ParseSqlValueSnafu {
+            msg: format!("{:?}", $expr),
         }
-    }
+        .fail();
+    };
+}
 
+impl Insert {
     pub fn table_name(&self) -> &ObjectName {
         match &self.inner {
             Statement::Insert { table_name, .. } => table_name,
@@ -47,19 +50,64 @@ impl Insert {
         }
     }
 
-    pub fn values(&self) -> Result<Vec<Vec<Value>>> {
-        let values = match &self.inner {
-            Statement::Insert { source, .. } => match &*source.body {
-                SetExpr::Values(Values { rows, .. }) => sql_exprs_to_values(rows)?,
-                _ => unreachable!(),
-            },
+    /// Extracts the literal insert statement body if possible
+    pub fn values_body(&self) -> Result<Vec<Vec<Value>>> {
+        match &self.inner {
+            Statement::Insert {
+                source:
+                    box Query {
+                        body: box SetExpr::Values(Values { rows, .. }),
+                        ..
+                    },
+                ..
+            } => sql_exprs_to_values(rows),
             _ => unreachable!(),
-        };
-        Ok(values)
+        }
+    }
+
+    /// Returns true when the insert statement can extract literal values.
+    /// The rules is the same as function `values_body()`.
+    pub fn can_extract_values(&self) -> bool {
+        match &self.inner {
+            Statement::Insert {
+                source:
+                    box Query {
+                        body: box SetExpr::Values(Values { rows, .. }),
+                        ..
+                    },
+                ..
+            } => rows.iter().all(|es| {
+                es.iter().all(|expr| match expr {
+                    Expr::Value(_) => true,
+                    Expr::Identifier(ident) => {
+                        if ident.quote_style.is_none() {
+                            ident.value.to_lowercase() == "default"
+                        } else {
+                            ident.quote_style == Some('"')
+                        }
+                    }
+                    Expr::UnaryOp { op, expr } => {
+                        matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
+                            && matches!(&**expr, Expr::Value(Value::Number(_, _)))
+                    }
+                    _ => false,
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    pub fn query_body(&self) -> Result<Option<GtQuery>> {
+        Ok(match &self.inner {
+            Statement::Insert {
+                source: box query, ..
+            } => Some(query.clone().try_into()?),
+            _ => None,
+        })
     }
 }
 
-fn sql_exprs_to_values(exprs: &Vec<Vec<Expr>>) -> Result<Vec<Vec<Value>>> {
+fn sql_exprs_to_values(exprs: &[Vec<Expr>]) -> Result<Vec<Vec<Value>>> {
     let mut values = Vec::with_capacity(exprs.len());
     for es in exprs.iter() {
         let mut vs = Vec::with_capacity(es.len());
@@ -68,9 +116,19 @@ fn sql_exprs_to_values(exprs: &Vec<Vec<Expr>>) -> Result<Vec<Vec<Value>>> {
                 Expr::Value(v) => v.clone(),
                 Expr::Identifier(ident) => {
                     if ident.quote_style.is_none() {
-                        Value::Placeholder(ident.value.clone())
+                        // Special processing for `default` value
+                        if ident.value.to_lowercase() == "default" {
+                            Value::Placeholder(ident.value.clone())
+                        } else {
+                            parse_fail!(expr);
+                        }
                     } else {
-                        Value::SingleQuotedString(ident.value.clone())
+                        // Identifiers with double quotes, we treat them as strings.
+                        if ident.quote_style == Some('"') {
+                            Value::SingleQuotedString(ident.value.clone())
+                        } else {
+                            parse_fail!(expr);
+                        }
                     }
                 }
                 Expr::UnaryOp { op, expr }
@@ -83,17 +141,11 @@ fn sql_exprs_to_values(exprs: &Vec<Vec<Expr>>) -> Result<Vec<Vec<Value>>> {
                             _ => unreachable!(),
                         }
                     } else {
-                        return error::ParseSqlValueSnafu {
-                            msg: format!("{expr:?}"),
-                        }
-                        .fail();
+                        parse_fail!(expr);
                     }
                 }
                 _ => {
-                    return error::ParseSqlValueSnafu {
-                        msg: format!("{expr:?}"),
-                    }
-                    .fail()
+                    parse_fail!(expr);
                 }
             });
         }
@@ -117,23 +169,21 @@ impl TryFrom<Statement> for Insert {
 
 #[cfg(test)]
 mod tests {
-    use sqlparser::dialect::GenericDialect;
-
     use super::*;
+    use crate::dialect::GreptimeDbDialect;
     use crate::parser::ParserContext;
+    use crate::statements::statement::Statement;
 
     #[test]
     fn test_insert_value_with_unary_op() {
-        use crate::statements::statement::Statement;
-
         // insert "-1"
         let sql = "INSERT INTO my_table VALUES(-1)";
-        let stmt = ParserContext::create_with_dialect(sql, &GenericDialect {})
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
             .unwrap()
             .remove(0);
         match stmt {
             Statement::Insert(insert) => {
-                let values = insert.values().unwrap();
+                let values = insert.values_body().unwrap();
                 assert_eq!(values, vec![vec![Value::Number("-1".to_string(), false)]]);
             }
             _ => unreachable!(),
@@ -141,12 +191,12 @@ mod tests {
 
         // insert "+1"
         let sql = "INSERT INTO my_table VALUES(+1)";
-        let stmt = ParserContext::create_with_dialect(sql, &GenericDialect {})
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
             .unwrap()
             .remove(0);
         match stmt {
             Statement::Insert(insert) => {
-                let values = insert.values().unwrap();
+                let values = insert.values_body().unwrap();
                 assert_eq!(values, vec![vec![Value::Number("1".to_string(), false)]]);
             }
             _ => unreachable!(),
@@ -155,16 +205,14 @@ mod tests {
 
     #[test]
     fn test_insert_value_with_default() {
-        use crate::statements::statement::Statement;
-
         // insert "default"
         let sql = "INSERT INTO my_table VALUES(default)";
-        let stmt = ParserContext::create_with_dialect(sql, &GenericDialect {})
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
             .unwrap()
             .remove(0);
         match stmt {
             Statement::Insert(insert) => {
-                let values = insert.values().unwrap();
+                let values = insert.values_body().unwrap();
                 assert_eq!(values, vec![vec![Value::Placeholder("default".to_owned())]]);
             }
             _ => unreachable!(),
@@ -173,16 +221,14 @@ mod tests {
 
     #[test]
     fn test_insert_value_with_default_uppercase() {
-        use crate::statements::statement::Statement;
-
         // insert "DEFAULT"
         let sql = "INSERT INTO my_table VALUES(DEFAULT)";
-        let stmt = ParserContext::create_with_dialect(sql, &GenericDialect {})
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
             .unwrap()
             .remove(0);
         match stmt {
             Statement::Insert(insert) => {
-                let values = insert.values().unwrap();
+                let values = insert.values_body().unwrap();
                 assert_eq!(values, vec![vec![Value::Placeholder("DEFAULT".to_owned())]]);
             }
             _ => unreachable!(),
@@ -191,20 +237,66 @@ mod tests {
 
     #[test]
     fn test_insert_value_with_quoted_string() {
-        use crate::statements::statement::Statement;
-
-        // insert "'default'"
+        // insert 'default'
         let sql = "INSERT INTO my_table VALUES('default')";
-        let stmt = ParserContext::create_with_dialect(sql, &GenericDialect {})
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
             .unwrap()
             .remove(0);
         match stmt {
             Statement::Insert(insert) => {
-                let values = insert.values().unwrap();
+                let values = insert.values_body().unwrap();
                 assert_eq!(
                     values,
                     vec![vec![Value::SingleQuotedString("default".to_owned())]]
                 );
+            }
+            _ => unreachable!(),
+        }
+
+        // insert "default". Treating double-quoted identifiers as strings.
+        let sql = "INSERT INTO my_table VALUES(\"default\")";
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
+            .unwrap()
+            .remove(0);
+        match stmt {
+            Statement::Insert(insert) => {
+                let values = insert.values_body().unwrap();
+                assert_eq!(
+                    values,
+                    vec![vec![Value::SingleQuotedString("default".to_owned())]]
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let sql = "INSERT INTO my_table VALUES(`default`)";
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
+            .unwrap()
+            .remove(0);
+        match stmt {
+            Statement::Insert(insert) => {
+                assert!(insert.values_body().is_err());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_insert_select() {
+        let sql = "INSERT INTO my_table select * from other_table";
+        let stmt = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {})
+            .unwrap()
+            .remove(0);
+        match stmt {
+            Statement::Insert(insert) => {
+                let q = insert.query_body().unwrap().unwrap();
+                assert!(matches!(
+                    q.inner,
+                    Query {
+                        body: box SetExpr::Select { .. },
+                        ..
+                    }
+                ));
             }
             _ => unreachable!(),
         }

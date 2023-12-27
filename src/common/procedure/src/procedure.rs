@@ -18,12 +18,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use smallvec::{smallvec, SmallVec};
 use snafu::{ResultExt, Snafu};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::watcher::Watcher;
 
 /// Procedure execution status.
+#[derive(Debug)]
 pub enum Status {
     /// The procedure is still executing.
     Executing {
@@ -57,11 +60,23 @@ impl Status {
     }
 }
 
+/// [ContextProvider] provides information about procedures in the [ProcedureManager].
+#[async_trait]
+pub trait ContextProvider: Send + Sync {
+    /// Query the procedure state.
+    async fn procedure_state(&self, procedure_id: ProcedureId) -> Result<Option<ProcedureState>>;
+}
+
+/// Reference-counted pointer to [ContextProvider].
+pub type ContextProviderRef = Arc<dyn ContextProvider>;
+
 /// Procedure execution context.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct Context {
     /// Id of the procedure.
     pub procedure_id: ProcedureId,
+    /// [ProcedureManager] context provider.
+    pub provider: ContextProviderRef,
 }
 
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
@@ -78,25 +93,60 @@ pub trait Procedure: Send + Sync {
     /// Dump the state of the procedure to a string.
     fn dump(&self) -> Result<String>;
 
-    /// Returns the [LockKey] if this procedure needs to acquire lock.
-    fn lock_key(&self) -> Option<LockKey>;
+    /// Returns the [LockKey] that this procedure needs to acquire.
+    fn lock_key(&self) -> LockKey;
 }
 
-/// A key to identify the lock.
-// We might hold multiple keys in this struct. When there are multiple keys, we need to sort the
-// keys lock all the keys in order to avoid dead lock.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockKey(String);
-
-impl LockKey {
-    /// Returns a new [LockKey].
-    pub fn new(key: impl Into<String>) -> LockKey {
-        LockKey(key.into())
+#[async_trait]
+impl<T: Procedure + ?Sized> Procedure for Box<T> {
+    fn type_name(&self) -> &str {
+        (**self).type_name()
     }
 
-    /// Returns the lock key.
-    pub fn key(&self) -> &str {
-        &self.0
+    async fn execute(&mut self, ctx: &Context) -> Result<Status> {
+        (**self).execute(ctx).await
+    }
+
+    fn dump(&self) -> Result<String> {
+        (**self).dump()
+    }
+
+    fn lock_key(&self) -> LockKey {
+        (**self).lock_key()
+    }
+}
+
+/// Keys to identify required locks.
+///
+/// [LockKey] always sorts keys lexicographically so that they can be acquired
+/// in the same order.
+// Most procedures should only acquire 1 ~ 2 locks so we use smallvec to hold keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LockKey(SmallVec<[String; 2]>);
+
+impl LockKey {
+    /// Returns a new [LockKey] with only one key.
+    pub fn single(key: impl Into<String>) -> LockKey {
+        LockKey(smallvec![key.into()])
+    }
+
+    /// Returns a new [LockKey] with keys from specific `iter`.
+    pub fn new(iter: impl IntoIterator<Item = String>) -> LockKey {
+        let mut vec: SmallVec<_> = iter.into_iter().collect();
+        vec.sort();
+        // Dedup keys to avoid acquiring the same key multiple times.
+        vec.dedup();
+        LockKey(vec)
+    }
+
+    /// Returns the keys to lock.
+    pub fn keys_to_lock(&self) -> impl Iterator<Item = &String> {
+        self.0.iter()
+    }
+
+    /// Returns the keys to unlock.
+    pub fn keys_to_unlock(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().rev()
     }
 }
 
@@ -118,6 +168,12 @@ impl ProcedureWithId {
             id: ProcedureId::random(),
             procedure,
         }
+    }
+}
+
+impl fmt::Debug for ProcedureWithId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.procedure.type_name(), self.id)
     }
 }
 
@@ -161,16 +217,59 @@ impl FromStr for ProcedureId {
 /// Loader to recover the [Procedure] instance from serialized data.
 pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Send>;
 
-// TODO(yingwen): Find a way to return the error message if the procedure is failed.
 /// State of a submitted procedure.
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub enum ProcedureState {
     /// The procedure is running.
+    #[default]
     Running,
     /// The procedure is finished.
     Done,
+    /// The procedure is failed and can be retried.
+    Retrying { error: Arc<Error> },
     /// The procedure is failed and cannot proceed anymore.
-    Failed,
+    Failed { error: Arc<Error> },
+}
+
+impl ProcedureState {
+    /// Returns a [ProcedureState] with failed state.
+    pub fn failed(error: Arc<Error>) -> ProcedureState {
+        ProcedureState::Failed { error }
+    }
+
+    /// Returns a [ProcedureState] with retrying state.
+    pub fn retrying(error: Arc<Error>) -> ProcedureState {
+        ProcedureState::Retrying { error }
+    }
+
+    /// Returns true if the procedure state is running.
+    pub fn is_running(&self) -> bool {
+        matches!(self, ProcedureState::Running)
+    }
+
+    /// Returns true if the procedure state is done.
+    pub fn is_done(&self) -> bool {
+        matches!(self, ProcedureState::Done)
+    }
+
+    /// Returns true if the procedure state failed.
+    pub fn is_failed(&self) -> bool {
+        matches!(self, ProcedureState::Failed { .. })
+    }
+
+    /// Returns true if the procedure state is retrying.
+    pub fn is_retrying(&self) -> bool {
+        matches!(self, ProcedureState::Retrying { .. })
+    }
+
+    /// Returns the error.
+    pub fn error(&self) -> Option<&Arc<Error>> {
+        match self {
+            ProcedureState::Failed { error } => Some(error),
+            ProcedureState::Retrying { error } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 // TODO(yingwen): Shutdown
@@ -180,18 +279,28 @@ pub trait ProcedureManager: Send + Sync + 'static {
     /// Registers loader for specific procedure type `name`.
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
 
-    /// Submits a procedure to execute.
-    async fn submit(&self, procedure: ProcedureWithId) -> Result<()>;
-
+    /// Starts the background GC task.
+    ///
     /// Recovers unfinished procedures and reruns them.
     ///
     /// Callers should ensure all loaders are registered.
-    async fn recover(&self) -> Result<()>;
+    async fn start(&self) -> Result<()>;
+
+    /// Stops the background GC task.
+    async fn stop(&self) -> Result<()>;
+
+    /// Submits a procedure to execute.
+    ///
+    /// Returns a [Watcher] to watch the created procedure.
+    async fn submit(&self, procedure: ProcedureWithId) -> Result<Watcher>;
 
     /// Query the procedure state.
     ///
     /// Returns `Ok(None)` if the procedure doesn't exist.
     async fn procedure_state(&self, procedure_id: ProcedureId) -> Result<Option<ProcedureState>>;
+
+    /// Returns a [Watcher] to watch [ProcedureState] of specific procedure.
+    fn procedure_watcher(&self, procedure_id: ProcedureId) -> Option<Watcher>;
 }
 
 /// Ref-counted pointer to the [ProcedureManager].
@@ -199,6 +308,9 @@ pub type ProcedureManagerRef = Arc<dyn ProcedureManager>;
 
 #[cfg(test)]
 mod tests {
+    use common_error::mock::MockError;
+    use common_error::status_code::StatusCode;
+
     use super::*;
 
     #[test]
@@ -228,8 +340,21 @@ mod tests {
     #[test]
     fn test_lock_key() {
         let entity = "catalog.schema.my_table";
-        let key = LockKey::new(entity);
-        assert_eq!(entity, key.key());
+        let key = LockKey::single(entity);
+        assert_eq!(vec![entity], key.keys_to_lock().collect::<Vec<_>>());
+        assert_eq!(vec![entity], key.keys_to_unlock().collect::<Vec<_>>());
+
+        let key = LockKey::new([
+            "b".to_string(),
+            "c".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+        ]);
+        assert_eq!(vec!["a", "b", "c"], key.keys_to_lock().collect::<Vec<_>>());
+        assert_eq!(
+            vec!["c", "b", "a"],
+            key.keys_to_unlock().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -252,5 +377,18 @@ mod tests {
 
         let parsed = serde_json::from_str(&json).unwrap();
         assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn test_procedure_state() {
+        assert!(ProcedureState::Running.is_running());
+        assert!(ProcedureState::Running.error().is_none());
+        assert!(ProcedureState::Done.is_done());
+
+        let state = ProcedureState::failed(Arc::new(Error::external(MockError::new(
+            StatusCode::Unexpected,
+        ))));
+        assert!(state.is_failed());
+        let _ = state.error().unwrap();
     }
 }

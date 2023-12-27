@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 use common_time::timestamp::TimeUnit;
 use common_time::Timestamp;
 use paste::paste;
@@ -125,11 +126,12 @@ mod tests {
 
     #[test]
     fn test_to_serde_json_value() {
+        std::env::set_var("TZ", "Asia/Shanghai");
         let ts = TimestampSecond::new(123);
         let val = serde_json::Value::from(ts);
         match val {
             serde_json::Value::String(s) => {
-                assert_eq!("1970-01-01 00:02:03+0000", s);
+                assert_eq!("1970-01-01 08:02:03+0800", s);
             }
             _ => unreachable!(),
         }

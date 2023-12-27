@@ -13,24 +13,92 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::sync::Arc;
 
 use crate::status_code::StatusCode;
 
 /// Extension to [`Error`](std::error::Error) in std.
-pub trait ErrorExt: std::error::Error {
+pub trait ErrorExt: StackError {
     /// Map this error to [StatusCode].
     fn status_code(&self) -> StatusCode {
         StatusCode::Unknown
     }
 
-    /// Get the reference to the backtrace of this error, None if the backtrace is unavailable.
-    // Add `_opt` suffix to avoid confusing with similar method in `std::error::Error`, once backtrace
-    // in std is stable, we can deprecate this method.
-    fn backtrace_opt(&self) -> Option<&crate::snafu::Backtrace>;
+    // TODO(ruihang): remove this default implementation
+    /// Get the location of this error, None if the location is unavailable.
+    /// Add `_opt` suffix to avoid confusing with similar method in `std::error::Error`
+    fn location_opt(&self) -> Option<crate::snafu::Location> {
+        None
+    }
 
     /// Returns the error as [Any](std::any::Any) so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
+
+    fn output_msg(&self) -> String
+    where
+        Self: Sized,
+    {
+        match self.status_code() {
+            StatusCode::Unknown | StatusCode::Internal => {
+                // masks internal error from end user
+                format!("Internal error: {}", self.status_code() as u32)
+            }
+            _ => {
+                let error = self.last();
+                if let Some(external_error) = error.source() {
+                    let external_root = external_error.sources().last().unwrap();
+
+                    if error.to_string().is_empty() {
+                        format!("{external_root}")
+                    } else {
+                        format!("{error}: {external_root}")
+                    }
+                } else {
+                    format!("{error}")
+                }
+            }
+        }
+    }
+}
+
+pub trait StackError: std::error::Error {
+    fn debug_fmt(&self, layer: usize, buf: &mut Vec<String>);
+
+    fn next(&self) -> Option<&dyn StackError>;
+
+    fn last(&self) -> &dyn StackError
+    where
+        Self: Sized,
+    {
+        let Some(mut result) = self.next() else {
+            return self;
+        };
+        while let Some(err) = result.next() {
+            result = err;
+        }
+        result
+    }
+}
+
+impl<T: ?Sized + StackError> StackError for Arc<T> {
+    fn debug_fmt(&self, layer: usize, buf: &mut Vec<String>) {
+        self.as_ref().debug_fmt(layer, buf)
+    }
+
+    fn next(&self) -> Option<&dyn StackError> {
+        self.as_ref().next()
+    }
+}
+
+impl<T: StackError> StackError for Box<T> {
+    fn debug_fmt(&self, layer: usize, buf: &mut Vec<String>) {
+        self.as_ref().debug_fmt(layer, buf)
+    }
+
+    fn next(&self) -> Option<&dyn StackError> {
+        self.as_ref().next()
+    }
 }
 
 /// An opaque boxed error based on errors that implement [ErrorExt] trait.
@@ -71,8 +139,8 @@ impl crate::ext::ErrorExt for BoxedError {
         self.inner.status_code()
     }
 
-    fn backtrace_opt(&self) -> Option<&crate::snafu::Backtrace> {
-        self.inner.backtrace_opt()
+    fn location_opt(&self) -> Option<crate::snafu::Location> {
+        self.inner.location_opt()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -84,7 +152,17 @@ impl crate::ext::ErrorExt for BoxedError {
 // via `ErrorCompat::backtrace()`.
 impl crate::snafu::ErrorCompat for BoxedError {
     fn backtrace(&self) -> Option<&crate::snafu::Backtrace> {
-        self.inner.backtrace_opt()
+        None
+    }
+}
+
+impl StackError for BoxedError {
+    fn debug_fmt(&self, layer: usize, buf: &mut Vec<String>) {
+        self.inner.debug_fmt(layer, buf)
+    }
+
+    fn next(&self) -> Option<&dyn StackError> {
+        self.inner.next()
     }
 }
 
@@ -118,7 +196,7 @@ impl crate::ext::ErrorExt for PlainError {
         self.status_code
     }
 
-    fn backtrace_opt(&self) -> Option<&crate::snafu::Backtrace> {
+    fn location_opt(&self) -> Option<crate::snafu::Location> {
         None
     }
 
@@ -127,61 +205,12 @@ impl crate::ext::ErrorExt for PlainError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::error::Error;
-
-    use snafu::ErrorCompat;
-
-    use super::*;
-    use crate::format::DebugFormat;
-    use crate::mock::MockError;
-
-    #[test]
-    fn test_opaque_error_without_backtrace() {
-        let err = BoxedError::new(MockError::new(StatusCode::Internal));
-        assert!(err.backtrace_opt().is_none());
-        assert_eq!(StatusCode::Internal, err.status_code());
-        assert!(err.as_any().downcast_ref::<MockError>().is_some());
-        assert!(err.source().is_none());
-
-        assert!(ErrorCompat::backtrace(&err).is_none());
+impl StackError for PlainError {
+    fn debug_fmt(&self, layer: usize, buf: &mut Vec<String>) {
+        buf.push(format!("{}: {}", layer, self.msg))
     }
 
-    #[test]
-    fn test_opaque_error_with_backtrace() {
-        let err = BoxedError::new(MockError::with_backtrace(StatusCode::Internal));
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::Internal, err.status_code());
-        assert!(err.as_any().downcast_ref::<MockError>().is_some());
-        assert!(err.source().is_none());
-
-        assert!(ErrorCompat::backtrace(&err).is_some());
-
-        let msg = format!("{err:?}");
-        assert!(msg.contains("\nBacktrace:\n"));
-        let fmt_msg = format!("{:?}", DebugFormat::new(&err));
-        assert_eq!(msg, fmt_msg);
-
-        let msg = err.to_string();
-        msg.contains("Internal");
-    }
-
-    #[test]
-    fn test_opaque_error_with_source() {
-        let leaf_err = MockError::with_backtrace(StatusCode::Internal);
-        let internal_err = MockError::with_source(leaf_err);
-        let err = BoxedError::new(internal_err);
-
-        assert!(err.backtrace_opt().is_some());
-        assert_eq!(StatusCode::Internal, err.status_code());
-        assert!(err.as_any().downcast_ref::<MockError>().is_some());
-        assert!(err.source().is_some());
-
-        let msg = format!("{err:?}");
-        assert!(msg.contains("\nBacktrace:\n"));
-        assert!(msg.contains("Caused by"));
-
-        assert!(ErrorCompat::backtrace(&err).is_some());
+    fn next(&self) -> Option<&dyn StackError> {
+        None
     }
 }

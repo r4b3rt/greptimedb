@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
+use common_procedure::BoxedProcedure;
 use tokio::sync::Mutex;
 
-use crate::engine::{EngineContext, TableEngine, TableReference};
-use crate::requests::{AlterTableRequest, CreateTableRequest, DropTableRequest, OpenTableRequest};
+use crate::engine::{EngineContext, TableEngine, TableEngineProcedure};
+use crate::metadata::TableId;
+use crate::requests::{
+    AlterTableRequest, CreateTableRequest, DropTableRequest, OpenTableRequest, TruncateTableRequest,
+};
 use crate::test_util::EmptyTable;
 use crate::{Result, TableRef};
 
@@ -49,9 +52,10 @@ impl TableEngine for MockTableEngine {
         let schema_name = request.schema_name.clone();
         let table_name = request.table_name.clone();
 
-        let table_ref = Arc::new(EmptyTable::new(request));
+        let table_ref = EmptyTable::table(request);
 
-        self.tables
+        let _ = self
+            .tables
             .lock()
             .await
             .insert((catalog_name, schema_name, table_name), table_ref.clone());
@@ -85,15 +89,61 @@ impl TableEngine for MockTableEngine {
         unimplemented!()
     }
 
-    fn get_table(&self, _ctx: &EngineContext, _ref: &TableReference) -> Result<Option<TableRef>> {
+    fn get_table(&self, _ctx: &EngineContext, _table_id: TableId) -> Result<Option<TableRef>> {
         unimplemented!()
     }
 
-    fn table_exists(&self, _ctx: &EngineContext, _name: &TableReference) -> bool {
+    fn table_exists(&self, _ctx: &EngineContext, _table_id: TableId) -> bool {
         unimplemented!()
     }
 
     async fn drop_table(&self, _ctx: &EngineContext, _request: DropTableRequest) -> Result<bool> {
+        unimplemented!()
+    }
+
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn truncate_table(
+        &self,
+        _ctx: &EngineContext,
+        _request: TruncateTableRequest,
+    ) -> Result<bool> {
+        unimplemented!()
+    }
+}
+
+impl TableEngineProcedure for MockTableEngine {
+    fn create_table_procedure(
+        &self,
+        _ctx: &EngineContext,
+        _request: CreateTableRequest,
+    ) -> Result<BoxedProcedure> {
+        unimplemented!()
+    }
+
+    fn alter_table_procedure(
+        &self,
+        _ctx: &EngineContext,
+        _request: AlterTableRequest,
+    ) -> Result<BoxedProcedure> {
+        unimplemented!()
+    }
+
+    fn drop_table_procedure(
+        &self,
+        _ctx: &EngineContext,
+        _request: DropTableRequest,
+    ) -> Result<BoxedProcedure> {
+        unimplemented!()
+    }
+
+    fn truncate_table_procedure(
+        &self,
+        _ctx: &EngineContext,
+        _request: TruncateTableRequest,
+    ) -> Result<BoxedProcedure> {
         unimplemented!()
     }
 }

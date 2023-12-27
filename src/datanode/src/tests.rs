@@ -12,6 +12,169 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod instance_test;
-mod promql_test;
-pub(crate) mod test_util;
+use std::any::Any;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use common_error::ext::BoxedError;
+use common_function::function::FunctionRef;
+use common_function::scalars::aggregate::AggregateFunctionMetaRef;
+use common_query::prelude::ScalarUdf;
+use common_query::Output;
+use common_recordbatch::SendableRecordBatchStream;
+use common_runtime::Runtime;
+use query::dataframe::DataFrame;
+use query::plan::LogicalPlan;
+use query::planner::LogicalPlanner;
+use query::query_engine::DescribeResult;
+use query::QueryEngine;
+use session::context::QueryContextRef;
+use store_api::metadata::RegionMetadataRef;
+use store_api::region_engine::{RegionEngine, RegionRole, SetReadonlyResponse};
+use store_api::region_request::{AffectedRows, RegionRequest};
+use store_api::storage::{RegionId, ScanRequest};
+use table::TableRef;
+use tokio::sync::mpsc::{Receiver, Sender};
+
+use crate::error::Error;
+use crate::event_listener::NoopRegionServerEventListener;
+use crate::region_server::RegionServer;
+
+pub struct MockQueryEngine;
+
+#[async_trait]
+impl QueryEngine for MockQueryEngine {
+    fn as_any(&self) -> &dyn Any {
+        self as _
+    }
+
+    fn planner(&self) -> Arc<dyn LogicalPlanner> {
+        unimplemented!()
+    }
+
+    fn name(&self) -> &str {
+        "MockQueryEngine"
+    }
+
+    async fn describe(&self, _plan: LogicalPlan) -> query::error::Result<DescribeResult> {
+        unimplemented!()
+    }
+
+    async fn execute(
+        &self,
+        _plan: LogicalPlan,
+        _query_ctx: QueryContextRef,
+    ) -> query::error::Result<Output> {
+        unimplemented!()
+    }
+
+    fn register_udf(&self, _udf: ScalarUdf) {}
+
+    fn register_aggregate_function(&self, _func: AggregateFunctionMetaRef) {}
+
+    fn register_function(&self, _func: FunctionRef) {}
+
+    fn read_table(&self, _table: TableRef) -> query::error::Result<DataFrame> {
+        unimplemented!()
+    }
+}
+
+/// Create a region server without any engine
+pub fn mock_region_server() -> RegionServer {
+    RegionServer::new(
+        Arc::new(MockQueryEngine),
+        Arc::new(Runtime::builder().build().unwrap()),
+        Box::new(NoopRegionServerEventListener),
+    )
+}
+
+pub type MockRequestHandler =
+    Box<dyn Fn(RegionId, RegionRequest) -> Result<AffectedRows, Error> + Send + Sync>;
+
+pub struct MockRegionEngine {
+    sender: Sender<(RegionId, RegionRequest)>,
+    handle_request_mock_fn: Option<MockRequestHandler>,
+}
+
+impl MockRegionEngine {
+    pub fn new() -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+
+        (
+            Arc::new(Self {
+                sender: tx,
+                handle_request_mock_fn: None,
+            }),
+            rx,
+        )
+    }
+
+    pub fn with_mock_fn(
+        mock_fn: MockRequestHandler,
+    ) -> (Arc<Self>, Receiver<(RegionId, RegionRequest)>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+
+        (
+            Arc::new(Self {
+                sender: tx,
+                handle_request_mock_fn: Some(mock_fn),
+            }),
+            rx,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl RegionEngine for MockRegionEngine {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn handle_request(
+        &self,
+        region_id: RegionId,
+        request: RegionRequest,
+    ) -> Result<AffectedRows, BoxedError> {
+        if let Some(mock_fn) = &self.handle_request_mock_fn {
+            return mock_fn(region_id, request).map_err(BoxedError::new);
+        };
+
+        let _ = self.sender.send((region_id, request)).await;
+        Ok(0)
+    }
+
+    async fn handle_query(
+        &self,
+        _region_id: RegionId,
+        _request: ScanRequest,
+    ) -> Result<SendableRecordBatchStream, BoxedError> {
+        unimplemented!()
+    }
+
+    async fn get_metadata(&self, _region_id: RegionId) -> Result<RegionMetadataRef, BoxedError> {
+        unimplemented!()
+    }
+
+    async fn region_disk_usage(&self, _region_id: RegionId) -> Option<i64> {
+        unimplemented!()
+    }
+
+    async fn stop(&self) -> Result<(), BoxedError> {
+        Ok(())
+    }
+
+    fn set_writable(&self, _region_id: RegionId, _writable: bool) -> Result<(), BoxedError> {
+        Ok(())
+    }
+
+    async fn set_readonly_gracefully(
+        &self,
+        _region_id: RegionId,
+    ) -> Result<SetReadonlyResponse, BoxedError> {
+        unimplemented!()
+    }
+
+    fn role(&self, _region_id: RegionId) -> Option<RegionRole> {
+        Some(RegionRole::Leader)
+    }
+}

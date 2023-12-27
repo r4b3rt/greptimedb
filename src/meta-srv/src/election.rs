@@ -14,11 +14,42 @@
 
 pub mod etcd;
 
+use std::fmt;
+use std::sync::Arc;
+
+use etcd_client::LeaderKey;
+use tokio::sync::broadcast::Receiver;
+
 use crate::error::Result;
 
-pub const LEASE_SECS: i64 = 3;
-pub const KEEP_ALIVE_PERIOD_SECS: u64 = LEASE_SECS as u64 * 2 / 3;
 pub const ELECTION_KEY: &str = "__meta_srv_election";
+
+#[derive(Debug, Clone)]
+pub enum LeaderChangeMessage {
+    Elected(Arc<LeaderKey>),
+    StepDown(Arc<LeaderKey>),
+}
+
+impl fmt::Display for LeaderChangeMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let leader_key = match self {
+            LeaderChangeMessage::Elected(leader_key) => {
+                write!(f, "Elected(")?;
+                leader_key
+            }
+            LeaderChangeMessage::StepDown(leader_key) => {
+                write!(f, "StepDown(")?;
+                leader_key
+            }
+        };
+        write!(f, "LeaderKey {{ ")?;
+        write!(f, "name: {}", String::from_utf8_lossy(leader_key.name()))?;
+        write!(f, ", key: {}", String::from_utf8_lossy(leader_key.key()))?;
+        write!(f, ", rev: {}", leader_key.rev())?;
+        write!(f, ", lease: {}", leader_key.lease())?;
+        write!(f, " }})")
+    }
+}
 
 #[async_trait::async_trait]
 pub trait Election: Send + Sync {
@@ -46,4 +77,6 @@ pub trait Election: Send + Sync {
     /// Releases election leadership so other campaigners may
     /// acquire leadership on the election.
     async fn resign(&self) -> Result<()>;
+
+    fn subscribe_leader_change(&self) -> Receiver<LeaderChangeMessage>;
 }

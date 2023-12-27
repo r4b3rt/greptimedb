@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use api::helper::{convert_i128_to_interval, convert_to_pb_decimal128};
 use api::v1::column::Values;
 use common_base::BitVec;
-use datatypes::types::{TimestampType, WrapperType};
+use datatypes::types::{DurationType, IntervalType, TimeType, TimestampType, WrapperType};
 use datatypes::vectors::{
-    BinaryVector, BooleanVector, DateTimeVector, DateVector, Float32Vector, Float64Vector,
-    Int16Vector, Int32Vector, Int64Vector, Int8Vector, StringVector, TimestampMicrosecondVector,
-    TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, UInt16Vector,
-    UInt32Vector, UInt64Vector, UInt8Vector, VectorRef,
+    BinaryVector, BooleanVector, DateTimeVector, DateVector, Decimal128Vector,
+    DurationMicrosecondVector, DurationMillisecondVector, DurationNanosecondVector,
+    DurationSecondVector, Float32Vector, Float64Vector, Int16Vector, Int32Vector, Int64Vector,
+    Int8Vector, IntervalDayTimeVector, IntervalMonthDayNanoVector, IntervalYearMonthVector,
+    StringVector, TimeMicrosecondVector, TimeMillisecondVector, TimeNanosecondVector,
+    TimeSecondVector, TimestampMicrosecondVector, TimestampMillisecondVector,
+    TimestampNanosecondVector, TimestampSecondVector, UInt16Vector, UInt32Vector, UInt64Vector,
+    UInt8Vector, VectorRef,
 };
 use snafu::OptionExt;
 
@@ -67,7 +72,7 @@ macro_rules! convert_arrow_array_to_grpc_vals {
                     return Ok(vals);
                 },
             )+
-            ConcreteDataType::Null(_) | ConcreteDataType::List(_) => unreachable!("Should not send {:?} in gRPC", $data_type),
+            ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Dictionary(_) => unreachable!("Should not send {:?} in gRPC", $data_type),
         }
     }};
 }
@@ -147,26 +152,98 @@ pub fn values(arrays: &[VectorRef]) -> Result<Values> {
         (
             ConcreteDataType::Timestamp(TimestampType::Second(_)),
             TimestampSecondVector,
-            ts_second_values,
+            timestamp_second_values,
             |x| { x.into_native() }
         ),
         (
             ConcreteDataType::Timestamp(TimestampType::Millisecond(_)),
             TimestampMillisecondVector,
-            ts_millisecond_values,
+            timestamp_millisecond_values,
             |x| { x.into_native() }
         ),
         (
             ConcreteDataType::Timestamp(TimestampType::Microsecond(_)),
             TimestampMicrosecondVector,
-            ts_microsecond_values,
+            timestamp_microsecond_values,
             |x| { x.into_native() }
         ),
         (
             ConcreteDataType::Timestamp(TimestampType::Nanosecond(_)),
             TimestampNanosecondVector,
-            ts_nanosecond_values,
+            timestamp_nanosecond_values,
             |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Time(TimeType::Second(_)),
+            TimeSecondVector,
+            time_second_values,
+            |x| { x.into_native() as i64 }
+        ),
+        (
+            ConcreteDataType::Time(TimeType::Millisecond(_)),
+            TimeMillisecondVector,
+            time_millisecond_values,
+            |x| { x.into_native() as i64 }
+        ),
+        (
+            ConcreteDataType::Time(TimeType::Microsecond(_)),
+            TimeMicrosecondVector,
+            time_microsecond_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Time(TimeType::Nanosecond(_)),
+            TimeNanosecondVector,
+            time_nanosecond_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Interval(IntervalType::YearMonth(_)),
+            IntervalYearMonthVector,
+            interval_year_month_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Interval(IntervalType::DayTime(_)),
+            IntervalDayTimeVector,
+            interval_day_time_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Interval(IntervalType::MonthDayNano(_)),
+            IntervalMonthDayNanoVector,
+            interval_month_day_nano_values,
+            |x| { convert_i128_to_interval(x.into_native()) }
+        ),
+        (
+            ConcreteDataType::Duration(DurationType::Second(_)),
+            DurationSecondVector,
+            duration_second_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Duration(DurationType::Millisecond(_)),
+            DurationMillisecondVector,
+            duration_millisecond_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Duration(DurationType::Microsecond(_)),
+            DurationMicrosecondVector,
+            duration_microsecond_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Duration(DurationType::Nanosecond(_)),
+            DurationNanosecondVector,
+            duration_nanosecond_values,
+            |x| { x.into_native() }
+        ),
+        (
+            ConcreteDataType::Decimal128(_),
+            Decimal128Vector,
+            decimal128_values,
+            |x| { convert_to_pb_decimal128(x) }
         )
     )
 }
@@ -185,6 +262,74 @@ mod tests {
         let values = values(&[array]).unwrap();
 
         assert_eq!(vec![1, 2, 3], values.i32_values);
+    }
+
+    #[test]
+    fn test_convert_arrow_array_time_second() {
+        let array = TimeSecondVector::from(vec![Some(1), Some(2), None, Some(3)]);
+        let array: VectorRef = Arc::new(array);
+
+        let values = values(&[array]).unwrap();
+
+        assert_eq!(vec![1, 2, 3], values.time_second_values);
+    }
+
+    #[test]
+    fn test_convert_arrow_array_interval_year_month() {
+        let array = IntervalYearMonthVector::from(vec![Some(1), Some(2), None, Some(3)]);
+        let array: VectorRef = Arc::new(array);
+
+        let values = values(&[array]).unwrap();
+
+        assert_eq!(vec![1, 2, 3], values.interval_year_month_values);
+    }
+
+    #[test]
+    fn test_convert_arrow_array_interval_day_time() {
+        let array = IntervalDayTimeVector::from(vec![Some(1), Some(2), None, Some(3)]);
+        let array: VectorRef = Arc::new(array);
+
+        let values = values(&[array]).unwrap();
+
+        assert_eq!(vec![1, 2, 3], values.interval_day_time_values);
+    }
+
+    #[test]
+    fn test_convert_arrow_array_interval_month_day_nano() {
+        let array = IntervalMonthDayNanoVector::from(vec![Some(1), Some(2), None, Some(3)]);
+        let array: VectorRef = Arc::new(array);
+
+        let values = values(&[array]).unwrap();
+
+        (0..3).for_each(|i| {
+            assert_eq!(values.interval_month_day_nano_values[i].months, 0);
+            assert_eq!(values.interval_month_day_nano_values[i].days, 0);
+            assert_eq!(
+                values.interval_month_day_nano_values[i].nanoseconds,
+                i as i64 + 1
+            );
+        })
+    }
+
+    #[test]
+    fn test_convert_arrow_array_duration_second() {
+        let array = DurationSecondVector::from(vec![Some(1), Some(2), None, Some(3)]);
+        let array: VectorRef = Arc::new(array);
+
+        let values = values(&[array]).unwrap();
+
+        assert_eq!(vec![1, 2, 3], values.duration_second_values);
+    }
+
+    #[test]
+    fn test_convert_arrow_array_decimal128() {
+        let array = Decimal128Vector::from(vec![Some(1), Some(2), None, Some(3)]);
+
+        let vals = values(&[Arc::new(array)]).unwrap();
+        (0..3).for_each(|i| {
+            assert_eq!(vals.decimal128_values[i].hi, 0);
+            assert_eq!(vals.decimal128_values[i].lo, i as i64 + 1);
+        });
     }
 
     #[test]

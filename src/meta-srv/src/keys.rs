@@ -14,8 +14,6 @@
 
 use std::str::FromStr;
 
-use api::v1::meta::TableName;
-use catalog::helper::TableGlobalKey;
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -25,10 +23,8 @@ use crate::error;
 use crate::error::Result;
 use crate::handler::node_stat::Stat;
 
-pub(crate) const REMOVED_PREFIX: &str = "__removed";
 pub(crate) const DN_LEASE_PREFIX: &str = "__meta_dnlease";
-pub(crate) const SEQ_PREFIX: &str = "__meta_seq";
-pub(crate) const TABLE_ROUTE_PREFIX: &str = "__meta_table_route";
+pub(crate) const INACTIVE_REGION_PREFIX: &str = "__meta_inactive_region";
 
 pub const DN_STAT_PREFIX: &str = "__meta_dnstat";
 
@@ -37,8 +33,13 @@ lazy_static! {
         Regex::new(&format!("^{DN_LEASE_PREFIX}-([0-9]+)-([0-9]+)$")).unwrap();
     static ref DATANODE_STAT_KEY_PATTERN: Regex =
         Regex::new(&format!("^{DN_STAT_PREFIX}-([0-9]+)-([0-9]+)$")).unwrap();
+    static ref INACTIVE_REGION_KEY_PATTERN: Regex = Regex::new(&format!(
+        "^{INACTIVE_REGION_PREFIX}-([0-9]+)-([0-9]+)-([0-9]+)$"
+    ))
+    .unwrap();
 }
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LeaseKey {
     pub cluster_id: u64,
     pub node_id: u64,
@@ -129,55 +130,19 @@ impl TryFrom<LeaseValue> for Vec<u8> {
     }
 }
 
-pub struct TableRouteKey<'a> {
-    pub table_id: u64,
-    pub catalog_name: &'a str,
-    pub schema_name: &'a str,
-    pub table_name: &'a str,
-}
-
-impl<'a> TableRouteKey<'a> {
-    pub fn with_table_name(table_id: u64, t: &'a TableName) -> Self {
-        Self {
-            table_id,
-            catalog_name: &t.catalog_name,
-            schema_name: &t.schema_name,
-            table_name: &t.table_name,
-        }
-    }
-
-    pub fn with_table_global_key(table_id: u64, t: &'a TableGlobalKey) -> Self {
-        Self {
-            table_id,
-            catalog_name: &t.catalog_name,
-            schema_name: &t.schema_name,
-            table_name: &t.table_name,
-        }
-    }
-
-    #[inline]
-    pub fn prefix(&self) -> String {
-        format!(
-            "{}-{}-{}-{}",
-            TABLE_ROUTE_PREFIX, self.catalog_name, self.schema_name, self.table_name
-        )
-    }
-
-    #[inline]
-    pub fn key(&self) -> String {
-        format!("{}-{}", self.prefix(), self.table_id)
-    }
-
-    #[inline]
-    pub fn removed_key(&self) -> String {
-        format!("{}-{}", REMOVED_PREFIX, self.key())
-    }
-}
-
-#[derive(Eq, PartialEq, Debug, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct StatKey {
     pub cluster_id: u64,
     pub node_id: u64,
+}
+
+impl From<&LeaseKey> for StatKey {
+    fn from(lease_key: &LeaseKey) -> Self {
+        StatKey {
+            cluster_id: lease_key.cluster_id,
+            node_id: lease_key.node_id,
+        }
+    }
 }
 
 impl From<StatKey> for Vec<u8> {
@@ -192,7 +157,7 @@ impl FromStr for StatKey {
     fn from_str(key: &str) -> Result<Self> {
         let caps = DATANODE_STAT_KEY_PATTERN
             .captures(key)
-            .context(error::InvalidLeaseKeySnafu { key })?;
+            .context(error::InvalidStatKeySnafu { key })?;
 
         ensure!(caps.len() == 3, error::InvalidStatKeySnafu { key });
 
@@ -222,22 +187,21 @@ impl TryFrom<Vec<u8>> for StatKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StatValue {
     pub stats: Vec<Stat>,
 }
 
 impl StatValue {
-    /// Get the region number from stat value.
+    /// Get the latest number of regions.
     pub fn region_num(&self) -> Option<u64> {
-        for stat in self.stats.iter() {
-            match stat.region_num {
-                Some(region_num) => return Some(region_num),
-                None => continue,
-            }
-        }
-        None
+        self.stats.last().map(|x| x.region_num)
+    }
+
+    /// Get the latest node addr.
+    pub fn node_addr(&self) -> Option<String> {
+        self.stats.last().map(|x| x.addr.clone())
     }
 }
 
@@ -246,7 +210,7 @@ impl TryFrom<StatValue> for Vec<u8> {
 
     fn try_from(stats: StatValue) -> Result<Self> {
         Ok(serde_json::to_string(&stats)
-            .context(crate::error::SerializeToJsonSnafu {
+            .context(error::SerializeToJsonSnafu {
                 input: format!("{stats:?}"),
             })?
             .into_bytes())
@@ -271,6 +235,74 @@ impl TryFrom<Vec<u8>> for StatValue {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct InactiveRegionKey {
+    pub cluster_id: u64,
+    pub node_id: u64,
+    pub region_id: u64,
+}
+
+impl InactiveRegionKey {
+    pub fn get_prefix_by_cluster(cluster_id: u64) -> Vec<u8> {
+        format!("{}-{}-", INACTIVE_REGION_PREFIX, cluster_id).into_bytes()
+    }
+}
+
+impl From<InactiveRegionKey> for Vec<u8> {
+    fn from(value: InactiveRegionKey) -> Self {
+        format!(
+            "{}-{}-{}-{}",
+            INACTIVE_REGION_PREFIX, value.cluster_id, value.node_id, value.region_id
+        )
+        .into_bytes()
+    }
+}
+
+impl FromStr for InactiveRegionKey {
+    type Err = error::Error;
+
+    fn from_str(key: &str) -> Result<Self> {
+        let caps = INACTIVE_REGION_KEY_PATTERN
+            .captures(key)
+            .context(error::InvalidInactiveRegionKeySnafu { key })?;
+
+        ensure!(
+            caps.len() == 4,
+            error::InvalidInactiveRegionKeySnafu { key }
+        );
+
+        let cluster_id = caps[1].to_string();
+        let node_id = caps[2].to_string();
+        let region_id = caps[3].to_string();
+
+        let cluster_id: u64 = cluster_id.parse().context(error::ParseNumSnafu {
+            err_msg: format!("invalid cluster_id: {cluster_id}"),
+        })?;
+        let node_id: u64 = node_id.parse().context(error::ParseNumSnafu {
+            err_msg: format!("invalid node_id: {node_id}"),
+        })?;
+        let region_id: u64 = region_id.parse().context(error::ParseNumSnafu {
+            err_msg: format!("invalid region_id: {region_id}"),
+        })?;
+
+        Ok(Self {
+            cluster_id,
+            node_id,
+            region_id,
+        })
+    }
+}
+
+impl TryFrom<Vec<u8>> for InactiveRegionKey {
+    type Error = error::Error;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self> {
+        String::from_utf8(bytes)
+            .context(error::InvalidRegionKeyFromUtf8Snafu {})
+            .map(|x| x.parse())?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,7 +314,7 @@ mod tests {
             node_id: 1,
         };
 
-        let key_bytes: Vec<u8> = key.try_into().unwrap();
+        let key_bytes: Vec<u8> = key.into();
         let new_key: StatKey = key_bytes.try_into().unwrap();
 
         assert_eq!(0, new_key.cluster_id);
@@ -294,8 +326,7 @@ mod tests {
         let stat = Stat {
             cluster_id: 0,
             id: 101,
-            is_leader: false,
-            region_num: Some(100),
+            region_num: 100,
             ..Default::default()
         };
 
@@ -307,11 +338,10 @@ mod tests {
 
         assert_eq!(1, stats.len());
 
-        let stat = stats.get(0).unwrap();
+        let stat = stats.first().unwrap();
         assert_eq!(0, stat.cluster_id);
         assert_eq!(101, stat.id);
-        assert!(!stat.is_leader);
-        assert_eq!(Some(100), stat.region_num);
+        assert_eq!(100, stat.region_num);
     }
 
     #[test]
@@ -341,6 +371,32 @@ mod tests {
     }
 
     #[test]
+    fn test_get_addr_from_stat_val() {
+        let empty = StatValue { stats: vec![] };
+        let addr = empty.node_addr();
+        assert!(addr.is_none());
+
+        let stat_val = StatValue {
+            stats: vec![
+                Stat {
+                    addr: "1".to_string(),
+                    ..Default::default()
+                },
+                Stat {
+                    addr: "2".to_string(),
+                    ..Default::default()
+                },
+                Stat {
+                    addr: "3".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let addr = stat_val.node_addr().unwrap();
+        assert_eq!("3", addr);
+    }
+
+    #[test]
     fn test_get_region_num_from_stat_val() {
         let empty = StatValue { stats: vec![] };
         let region_num = empty.region_num();
@@ -348,30 +404,57 @@ mod tests {
 
         let wrong = StatValue {
             stats: vec![Stat {
-                region_num: None,
+                region_num: 0,
                 ..Default::default()
             }],
         };
         let right = wrong.region_num();
-        assert!(right.is_none());
+        assert_eq!(Some(0), right);
 
         let stat_val = StatValue {
             stats: vec![
                 Stat {
-                    region_num: Some(1),
+                    region_num: 1,
                     ..Default::default()
                 },
                 Stat {
-                    region_num: None,
+                    region_num: 0,
                     ..Default::default()
                 },
                 Stat {
-                    region_num: Some(2),
+                    region_num: 2,
                     ..Default::default()
                 },
             ],
         };
         let region_num = stat_val.region_num().unwrap();
-        assert_eq!(1, region_num);
+        assert_eq!(2, region_num);
+    }
+
+    #[test]
+    fn test_lease_key_to_stat_key() {
+        let lease_key = LeaseKey {
+            cluster_id: 1,
+            node_id: 101,
+        };
+
+        let stat_key: StatKey = (&lease_key).into();
+
+        assert_eq!(1, stat_key.cluster_id);
+        assert_eq!(101, stat_key.node_id);
+    }
+
+    #[test]
+    fn test_inactive_region_key_round_trip() {
+        let key = InactiveRegionKey {
+            cluster_id: 0,
+            node_id: 1,
+            region_id: 2,
+        };
+
+        let key_bytes: Vec<u8> = key.into();
+        let new_key: InactiveRegionKey = key_bytes.try_into().unwrap();
+
+        assert_eq!(new_key, key);
     }
 }

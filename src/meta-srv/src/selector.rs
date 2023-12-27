@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod common;
 pub mod lease_based;
 pub mod load_based;
-
-use std::sync::Arc;
+mod weight_compute;
+mod weighted_choose;
 
 use serde::{Deserialize, Serialize};
 
-use self::lease_based::LeaseBasedSelector;
-use self::load_based::LoadBasedSelector;
 use crate::error;
 use crate::error::Result;
-use crate::metasrv::SelectorRef;
 
 pub type Namespace = u64;
 
@@ -32,28 +30,37 @@ pub trait Selector: Send + Sync {
     type Context;
     type Output;
 
-    async fn select(&self, ns: Namespace, ctx: &Self::Context) -> Result<Self::Output>;
+    async fn select(
+        &self,
+        ns: Namespace,
+        ctx: &Self::Context,
+        opts: SelectorOptions,
+    ) -> Result<Self::Output>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SelectorType {
-    LoadBased,
-    LeaseBased,
+#[derive(Debug)]
+pub struct SelectorOptions {
+    /// Minimum number of selected results.
+    pub min_required_items: usize,
+    /// Whether duplicates are allowed in the selected result, default false.
+    pub allow_duplication: bool,
 }
 
-impl From<SelectorType> for SelectorRef {
-    fn from(selector_type: SelectorType) -> Self {
-        match selector_type {
-            SelectorType::LoadBased => Arc::new(LoadBasedSelector) as SelectorRef,
-            SelectorType::LeaseBased => Arc::new(LeaseBasedSelector) as SelectorRef,
+impl Default for SelectorOptions {
+    fn default() -> Self {
+        Self {
+            min_required_items: 1,
+            allow_duplication: false,
         }
     }
 }
 
-impl Default for SelectorType {
-    fn default() -> Self {
-        SelectorType::LeaseBased
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(try_from = "String")]
+pub enum SelectorType {
+    #[default]
+    LoadBased,
+    LeaseBased,
 }
 
 impl TryFrom<&str> for SelectorType {
@@ -61,13 +68,21 @@ impl TryFrom<&str> for SelectorType {
 
     fn try_from(value: &str) -> Result<Self> {
         match value {
-            "LoadBased" => Ok(SelectorType::LoadBased),
-            "LeaseBased" => Ok(SelectorType::LeaseBased),
+            "load_based" | "LoadBased" => Ok(SelectorType::LoadBased),
+            "lease_based" | "LeaseBased" => Ok(SelectorType::LeaseBased),
             other => error::UnsupportedSelectorTypeSnafu {
                 selector_type: other,
             }
             .fail(),
         }
+    }
+}
+
+impl TryFrom<String> for SelectorType {
+    type Error = error::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        SelectorType::try_from(value.as_str())
     }
 }
 
@@ -78,21 +93,27 @@ mod tests {
 
     #[test]
     fn test_default_selector_type() {
-        assert_eq!(SelectorType::LeaseBased, SelectorType::default());
+        assert_eq!(SelectorType::LoadBased, SelectorType::default());
     }
 
     #[test]
     fn test_convert_str_to_selector_type() {
-        let leasebased = "LeaseBased";
-        let selector_type = leasebased.try_into().unwrap();
+        let lease_based = "lease_based";
+        let selector_type = lease_based.try_into().unwrap();
+        assert_eq!(SelectorType::LeaseBased, selector_type);
+        let lease_based = "LeaseBased";
+        let selector_type = lease_based.try_into().unwrap();
         assert_eq!(SelectorType::LeaseBased, selector_type);
 
-        let loadbased = "LoadBased";
-        let selector_type = loadbased.try_into().unwrap();
+        let load_based = "load_based";
+        let selector_type = load_based.try_into().unwrap();
+        assert_eq!(SelectorType::LoadBased, selector_type);
+        let load_based = "LoadBased";
+        let selector_type = load_based.try_into().unwrap();
         assert_eq!(SelectorType::LoadBased, selector_type);
 
-        let unknow = "unknow";
-        let selector_type: Result<SelectorType> = unknow.try_into();
+        let unknown = "unknown";
+        let selector_type: Result<SelectorType> = unknown.try_into();
         assert!(selector_type.is_err());
     }
 }

@@ -4,40 +4,49 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+testing = []
+
 [dependencies]
-api = { path = "../api" }
+api.workspace = true
 arrow-flight.workspace = true
 async-stream.workspace = true
-common-base = { path = "../common/base" }
-common-catalog = { path = "../common/catalog" }
-common-error = { path = "../common/error" }
-common-grpc = { path = "../common/grpc" }
-common-grpc-expr = { path = "../common/grpc-expr" }
-common-query = { path = "../common/query" }
-common-recordbatch = { path = "../common/recordbatch" }
-common-time = { path = "../common/time" }
+async-trait.workspace = true
+common-base.workspace = true
+common-catalog.workspace = true
+common-error.workspace = true
+common-grpc.workspace = true
+common-macro.workspace = true
+common-meta.workspace = true
+common-query.workspace = true
+common-recordbatch.workspace = true
+common-telemetry.workspace = true
+common-time.workspace = true
 datafusion.workspace = true
-datatypes = { path = "../datatypes" }
+datatypes.workspace = true
+derive_builder.workspace = true
 enum_dispatch = "0.3"
 futures-util.workspace = true
+lazy_static.workspace = true
+moka = { workspace = true, features = ["future"] }
 parking_lot = "0.12"
+prometheus.workspace = true
 prost.workspace = true
-rand = "0.8"
+rand.workspace = true
+session.workspace = true
 snafu.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
+tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
-datanode = { path = "../datanode" }
-substrait = { path = "../common/substrait" }
-tokio.workspace = true
+common-grpc-expr.workspace = true
+datanode.workspace = true
+derive-new = "0.5"
+substrait.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# TODO(ruihang): upgrade to 0.11 once substrait-rs supports it.
-[dev-dependencies.prost_09]
-package = "prost"
-version = "0.9"
-
 [dev-dependencies.substrait_proto]
 package = "substrait"
-version = "0.2"
+version = "0.17"

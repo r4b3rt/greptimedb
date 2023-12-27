@@ -12,32 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::meta::{Error, HeartbeatRequest};
+use api::v1::meta::{Error, HeartbeatRequest, Role};
+use common_telemetry::warn;
 
 use crate::error::Result;
-use crate::handler::{HeartbeatAccumulator, HeartbeatHandler};
+use crate::handler::{HandleControl, HeartbeatAccumulator, HeartbeatHandler};
 use crate::metasrv::Context;
 
-#[derive(Default)]
 pub struct CheckLeaderHandler;
 
 #[async_trait::async_trait]
 impl HeartbeatHandler for CheckLeaderHandler {
+    fn is_acceptable(&self, role: Role) -> bool {
+        role == Role::Datanode
+    }
+
     async fn handle(
         &self,
-        _req: &HeartbeatRequest,
+        req: &HeartbeatRequest,
         ctx: &mut Context,
         acc: &mut HeartbeatAccumulator,
-    ) -> Result<()> {
-        if let Some(election) = &ctx.election {
-            if election.is_leader() {
-                return Ok(());
-            }
-            if let Some(header) = &mut acc.header {
-                header.error = Some(Error::is_not_leader());
-                ctx.set_skip_all();
-            }
+    ) -> Result<HandleControl> {
+        let Some(election) = &ctx.election else {
+            return Ok(HandleControl::Continue);
+        };
+
+        if election.is_leader() {
+            return Ok(HandleControl::Continue);
         }
-        Ok(())
+
+        warn!(
+            "A heartbeat was received {:?}, however, since the current node is not the leader,\
+            this heartbeat will be disregarded.",
+            req.header
+        );
+
+        if let Some(header) = &mut acc.header {
+            header.error = Some(Error::is_not_leader());
+        }
+
+        return Ok(HandleControl::Done);
     }
 }

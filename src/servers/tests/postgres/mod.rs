@@ -14,28 +14,30 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use auth::tests::{DatabaseAuthInfo, MockUserProvider};
+use auth::UserProviderRef;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_runtime::Builder as RuntimeBuilder;
 use pgwire::api::Type;
 use rand::rngs::StdRng;
 use rand::Rng;
-use rustls::client::{ServerCertVerified, ServerCertVerifier};
-use rustls::{Certificate, Error, ServerName};
-use servers::auth::UserProviderRef;
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+use rustls::{Error, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName};
 use servers::error::Result;
 use servers::postgres::PostgresServer;
 use servers::server::Server;
 use servers::tls::TlsOption;
 use table::test_util::MemTable;
+use table::TableRef;
 use tokio_postgres::{Client, Error as PgError, NoTls, SimpleQueryMessage};
 
-use crate::auth::{DatabaseAuthInfo, MockUserProvider};
 use crate::create_testing_instance;
 
 fn create_postgres_server(
-    table: MemTable,
+    table: TableRef,
     check_pwd: bool,
     tls: TlsOption,
     auth_info: Option<DatabaseAuthInfo>,
@@ -73,7 +75,7 @@ pub async fn test_start_postgres_server() -> Result<()> {
     let pg_server = create_postgres_server(table, false, Default::default(), None)?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let result = pg_server.start(listening).await;
-    assert!(result.is_ok());
+    let _ = result.unwrap();
 
     let result = pg_server.start(listening).await;
     assert!(result
@@ -85,8 +87,8 @@ pub async fn test_start_postgres_server() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_shutdown_pg_server_range() -> Result<()> {
-    assert!(test_shutdown_pg_server(false).await.is_ok());
-    assert!(test_shutdown_pg_server(true).await.is_ok());
+    test_shutdown_pg_server(false).await.unwrap();
+    test_shutdown_pg_server(true).await.unwrap();
     Ok(())
 }
 
@@ -110,10 +112,8 @@ async fn test_schema_validating() -> Result<()> {
     })
     .await?;
 
-    let pass = create_plain_connection(server_port, true).await;
-    assert!(pass.is_ok());
-    let result = pg_server.shutdown().await;
-    assert!(result.is_ok());
+    let _ = create_plain_connection(server_port, true).await.unwrap();
+    pg_server.shutdown().await.unwrap();
 
     let (pg_server, server_port) = generate_server(DatabaseAuthInfo {
         catalog: DEFAULT_CATALOG_NAME,
@@ -124,8 +124,7 @@ async fn test_schema_validating() -> Result<()> {
 
     let fail = create_plain_connection(server_port, true).await;
     assert!(fail.is_err());
-    let result = pg_server.shutdown().await;
-    assert!(result.is_ok());
+    pg_server.shutdown().await.unwrap();
 
     Ok(())
 }
@@ -177,8 +176,7 @@ async fn test_shutdown_pg_server(with_pwd: bool) -> Result<()> {
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let result = postgres_server.shutdown().await;
-    assert!(result.is_ok());
+    postgres_server.shutdown().await.unwrap();
 
     for handle in join_handles.iter_mut() {
         let result = handle.await.unwrap();
@@ -305,7 +303,7 @@ async fn test_using_db() -> Result<()> {
         .await
         .unwrap();
     let result = client.simple_query("SELECT uint32s FROM numbers").await;
-    assert!(result.is_ok());
+    let _ = result.unwrap();
 
     let client = create_connection_with_given_catalog_schema(
         server_port,
@@ -313,7 +311,7 @@ async fn test_using_db() -> Result<()> {
         DEFAULT_SCHEMA_NAME,
     )
     .await;
-    assert!(client.is_ok());
+    let _ = client.unwrap();
 
     let client =
         create_connection_with_given_catalog_schema(server_port, "notfound", DEFAULT_SCHEMA_NAME)
@@ -366,11 +364,11 @@ async fn do_simple_query(server_tls: TlsOption, client_tls: bool) -> Result<()> 
     if !client_tls {
         let client = create_plain_connection(server_port, false).await.unwrap();
         let result = client.simple_query("SELECT uint32s FROM numbers").await;
-        assert!(result.is_ok());
+        let _ = result.unwrap();
     } else {
         let client = create_secure_connection(server_port, false).await.unwrap();
         let result = client.simple_query("SELECT uint32s FROM numbers").await;
-        assert!(result.is_ok());
+        let _ = result.unwrap();
     }
 
     Ok(())
@@ -389,7 +387,6 @@ async fn create_secure_connection(
     };
 
     let mut config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
     config
@@ -399,7 +396,7 @@ async fn create_secure_connection(
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(config);
     let (client, conn) = tokio_postgres::connect(&url, tls).await.expect("connect");
 
-    tokio::spawn(conn);
+    let _handle = tokio::spawn(conn);
     Ok(client)
 }
 
@@ -415,7 +412,7 @@ async fn create_plain_connection(
         format!("host=127.0.0.1 port={port} connect_timeout=2 dbname={DEFAULT_SCHEMA_NAME}")
     };
     let (client, conn) = tokio_postgres::connect(&url, NoTls).await?;
-    tokio::spawn(conn);
+    let _handle = tokio::spawn(conn);
     Ok(client)
 }
 
@@ -425,7 +422,7 @@ async fn create_connection_with_given_db(
 ) -> std::result::Result<Client, PgError> {
     let url = format!("host=127.0.0.1 port={port} connect_timeout=2 dbname={db}");
     let (client, conn) = tokio_postgres::connect(&url, NoTls).await?;
-    tokio::spawn(conn);
+    let _handle = tokio::spawn(conn);
     Ok(client)
 }
 
@@ -436,14 +433,14 @@ async fn create_connection_with_given_catalog_schema(
 ) -> std::result::Result<Client, PgError> {
     let url = format!("host=127.0.0.1 port={port} connect_timeout=2 dbname={catalog}-{schema}");
     let (client, conn) = tokio_postgres::connect(&url, NoTls).await?;
-    tokio::spawn(conn);
+    let _handle = tokio::spawn(conn);
     Ok(client)
 }
 
 async fn create_connection_without_db(port: u16) -> std::result::Result<Client, PgError> {
     let url = format!("host=127.0.0.1 port={port} connect_timeout=2");
     let (client, conn) = tokio_postgres::connect(&url, NoTls).await?;
-    tokio::spawn(conn);
+    let _handle = tokio::spawn(conn);
     Ok(client)
 }
 
@@ -458,16 +455,45 @@ fn unwrap_results(resp: &[SimpleQueryMessage]) -> Vec<&str> {
     resp.iter().filter_map(|m| resolve_result(m, 0)).collect()
 }
 
+#[derive(Debug)]
 struct AcceptAllVerifier {}
 impl ServerCertVerifier for AcceptAllVerifier {
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::ED25519,
+        ]
+    }
+
     fn verify_server_cert(
         &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: SystemTime,
+        _now: rustls_pki_types::UnixTime,
     ) -> std::result::Result<ServerCertVerified, Error> {
         Ok(ServerCertVerified::assertion())
     }

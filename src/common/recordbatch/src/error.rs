@@ -15,60 +15,97 @@
 //! Error of record batch.
 use std::any::Any;
 
-use common_error::ext::BoxedError;
-use common_error::prelude::*;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
+use datatypes::prelude::ConcreteDataType;
+use snafu::{Location, Snafu};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Fail to create datafusion record batch, source: {}", source))]
+    #[snafu(display("Fail to create datafusion record batch"))]
     NewDfRecordBatch {
-        source: datatypes::arrow::error::ArrowError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: datatypes::arrow::error::ArrowError,
+        location: Location,
     },
 
-    #[snafu(display("Data types error, source: {}", source))]
+    #[snafu(display("Data types error"))]
     DataTypes {
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
     },
 
-    #[snafu(display("External error, source: {}", source))]
+    #[snafu(display("External error"))]
     External {
-        #[snafu(backtrace)]
+        location: Location,
         source: BoxedError,
     },
 
     #[snafu(display("Failed to create RecordBatches, reason: {}", reason))]
-    CreateRecordBatches {
-        reason: String,
-        backtrace: Backtrace,
-    },
+    CreateRecordBatches { reason: String, location: Location },
 
-    #[snafu(display("Failed to convert Arrow schema, source: {}", source))]
+    #[snafu(display("Failed to convert Arrow schema"))]
     SchemaConversion {
         source: datatypes::error::Error,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display("Failed to poll stream, source: {}", source))]
+    #[snafu(display(""))]
     PollStream {
-        source: datatypes::arrow::error::ArrowError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+        location: Location,
     },
 
-    #[snafu(display("Fail to format record batch, source: {}", source))]
+    #[snafu(display("Fail to format record batch"))]
     Format {
-        source: datatypes::arrow::error::ArrowError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: datatypes::arrow::error::ArrowError,
+        location: Location,
     },
 
-    #[snafu(display("Failed to init Recordbatch stream, source: {}", source))]
+    #[snafu(display("Failed to init Recordbatch stream"))]
     InitRecordbatchStream {
-        source: datafusion_common::DataFusionError,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: datafusion_common::DataFusionError,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to project Arrow RecordBatch with schema {:?} and projection {:?}",
+        schema,
+        projection,
+    ))]
+    ProjectArrowRecordBatch {
+        #[snafu(source)]
+        error: datatypes::arrow::error::ArrowError,
+        location: Location,
+        schema: datatypes::schema::SchemaRef,
+        projection: Vec<usize>,
+    },
+
+    #[snafu(display("Column {} not exists in table {}", column_name, table_name))]
+    ColumnNotExists {
+        column_name: String,
+        table_name: String,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to cast vector of type '{:?}' to type '{:?}'",
+        from_type,
+        to_type,
+    ))]
+    CastVector {
+        from_type: ConcreteDataType,
+        to_type: ConcreteDataType,
+        location: Location,
+        source: datatypes::error::Error,
     },
 }
 
@@ -81,16 +118,16 @@ impl ErrorExt for Error {
             | Error::CreateRecordBatches { .. }
             | Error::PollStream { .. }
             | Error::Format { .. }
-            | Error::InitRecordbatchStream { .. } => StatusCode::Internal,
+            | Error::InitRecordbatchStream { .. }
+            | Error::ColumnNotExists { .. }
+            | Error::ProjectArrowRecordBatch { .. } => StatusCode::Internal,
 
-            Error::External { source } => source.status_code(),
+            Error::External { source, .. } => source.status_code(),
 
-            Error::SchemaConversion { source, .. } => source.status_code(),
+            Error::SchemaConversion { source, .. } | Error::CastVector { source, .. } => {
+                source.status_code()
+            }
         }
-    }
-
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {

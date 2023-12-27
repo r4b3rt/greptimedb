@@ -15,12 +15,13 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, Days, Months, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
 
 use crate::error::{Error, ParseDateStrSnafu, Result};
+use crate::interval::Interval;
 
 const UNIX_EPOCH_FROM_CE: i32 = 719_163;
 
@@ -41,6 +42,7 @@ impl FromStr for Date {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
         let date = NaiveDate::parse_from_str(s, "%F").context(ParseDateStrSnafu { raw: s })?;
         Ok(Self(date.num_days_from_ce() - UNIX_EPOCH_FROM_CE))
     }
@@ -49,6 +51,12 @@ impl FromStr for Date {
 impl From<i32> for Date {
     fn from(v: i32) -> Self {
         Self(v)
+    }
+}
+
+impl From<NaiveDate> for Date {
+    fn from(date: NaiveDate) -> Self {
+        Self(date.num_days_from_ce() - UNIX_EPOCH_FROM_CE)
     }
 }
 
@@ -70,6 +78,40 @@ impl Date {
 
     pub fn val(&self) -> i32 {
         self.0
+    }
+
+    pub fn to_chrono_date(&self) -> Option<NaiveDate> {
+        NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_FROM_CE + self.0)
+    }
+
+    pub fn to_secs(&self) -> i64 {
+        (self.0 as i64) * 24 * 3600
+    }
+
+    /// Adds given Interval to the current date.
+    /// Returns None if the resulting date would be out of range.
+    pub fn add_interval(&self, interval: Interval) -> Option<Date> {
+        let naive_date = self.to_chrono_date()?;
+
+        let (months, days, _) = interval.to_month_day_nano();
+
+        naive_date
+            .checked_add_months(Months::new(months as u32))?
+            .checked_add_days(Days::new(days as u64))
+            .map(Into::into)
+    }
+
+    /// Subtracts given Interval to the current date.
+    /// Returns None if the resulting date would be out of range.
+    pub fn sub_interval(&self, interval: Interval) -> Option<Date> {
+        let naive_date = self.to_chrono_date()?;
+
+        let (months, days, _) = interval.to_month_day_nano();
+
+        naive_date
+            .checked_sub_months(Months::new(months as u32))?
+            .checked_sub_days(Days::new(days as u64))
+            .map(Into::into)
     }
 }
 
@@ -98,8 +140,27 @@ mod tests {
             Date::from_str("1969-01-01").unwrap().to_string()
         );
 
+        assert_eq!(
+            "1969-01-01",
+            Date::from_str("     1969-01-01       ")
+                .unwrap()
+                .to_string()
+        );
+
         let now = Utc::now().date_naive().format("%F").to_string();
         assert_eq!(now, Date::from_str(&now).unwrap().to_string());
+    }
+
+    #[test]
+    fn test_add_sub_interval() {
+        let date = Date::new(1000);
+
+        let interval = Interval::from_year_month(3);
+
+        let new_date = date.add_interval(interval).unwrap();
+        assert_eq!(new_date.val(), 1091);
+
+        assert_eq!(date, new_date.sub_interval(interval).unwrap());
     }
 
     #[test]
@@ -113,5 +174,15 @@ mod tests {
     pub fn test_from() {
         let d: Date = 42.into();
         assert_eq!(42, d.val());
+    }
+
+    #[test]
+    fn test_to_secs() {
+        let d = Date::from_str("1970-01-01").unwrap();
+        assert_eq!(d.to_secs(), 0);
+        let d = Date::from_str("1970-01-02").unwrap();
+        assert_eq!(d.to_secs(), 24 * 3600);
+        let d = Date::from_str("1970-01-03").unwrap();
+        assert_eq!(d.to_secs(), 2 * 24 * 3600);
     }
 }

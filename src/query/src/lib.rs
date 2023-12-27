@@ -12,22 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod datafusion;
+#![feature(let_chains)]
+#![feature(int_roundings)]
+
+pub mod dataframe;
+pub mod datafusion;
+pub mod dist_plan;
 pub mod error;
 pub mod executor;
-mod function;
 pub mod logical_optimizer;
-mod metric;
+mod metrics;
 mod optimizer;
 pub mod parser;
 pub mod physical_optimizer;
 pub mod physical_planner;
+pub mod physical_wrapper;
 pub mod plan;
 pub mod planner;
 pub mod query_engine;
+mod range_select;
+pub mod region_query;
 pub mod sql;
+pub mod table_mutation;
 
 pub use crate::datafusion::DfContextProviderAdapter;
 pub use crate::query_engine::{
     QueryEngine, QueryEngineContext, QueryEngineFactory, QueryEngineRef,
 };
+
+#[cfg(test)]
+mod tests;

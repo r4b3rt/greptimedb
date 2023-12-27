@@ -13,20 +13,19 @@
 // limitations under the License.
 
 mod column_schema;
-mod constraint;
+pub mod constraint;
 mod raw;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema as ArrowSchema};
-pub use column_schema::TIME_INDEX_KEY;
 use datafusion_common::DFSchemaRef;
 use snafu::{ensure, ResultExt};
 
-use crate::data_type::DataType;
-use crate::error::{self, Error, Result};
-pub use crate::schema::column_schema::{ColumnSchema, Metadata};
+use crate::error::{self, DuplicateColumnSnafu, Error, ProjectArrowSchemaSnafu, Result};
+pub use crate::schema::column_schema::{ColumnSchema, Metadata, COMMENT_KEY, TIME_INDEX_KEY};
 pub use crate::schema::constraint::ColumnDefaultConstraint;
 pub use crate::schema::raw::RawSchema;
 
@@ -34,7 +33,7 @@ pub use crate::schema::raw::RawSchema;
 pub const VERSION_KEY: &str = "greptime:version";
 
 /// A common schema, should be immutable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Schema {
     column_schemas: Vec<ColumnSchema>,
     name_to_index: HashMap<String, usize>,
@@ -48,6 +47,17 @@ pub struct Schema {
     ///
     /// Initial value is zero. The version should bump after altering schema.
     version: u32,
+}
+
+impl fmt::Debug for Schema {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Schema")
+            .field("column_schemas", &self.column_schemas)
+            .field("name_to_index", &self.name_to_index)
+            .field("timestamp_index", &self.timestamp_index)
+            .field("version", &self.version)
+            .finish()
+    }
 }
 
 impl Schema {
@@ -71,12 +81,10 @@ impl Schema {
         SchemaBuilder::try_from(column_schemas)?.build()
     }
 
-    #[inline]
     pub fn arrow_schema(&self) -> &Arc<ArrowSchema> {
         &self.arrow_schema
     }
 
-    #[inline]
     pub fn column_schemas(&self) -> &[ColumnSchema] {
         &self.column_schemas
     }
@@ -90,50 +98,76 @@ impl Schema {
     /// Retrieve the column's name by index
     /// # Panics
     /// This method **may** panic if the index is out of range of column schemas.
-    #[inline]
     pub fn column_name_by_index(&self, idx: usize) -> &str {
         &self.column_schemas[idx].name
     }
 
-    #[inline]
     pub fn column_index_by_name(&self, name: &str) -> Option<usize> {
         self.name_to_index.get(name).copied()
     }
 
-    #[inline]
     pub fn contains_column(&self, name: &str) -> bool {
         self.name_to_index.contains_key(name)
     }
 
-    #[inline]
     pub fn num_columns(&self) -> usize {
         self.column_schemas.len()
     }
 
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.column_schemas.is_empty()
     }
 
     /// Returns index of the timestamp key column.
-    #[inline]
     pub fn timestamp_index(&self) -> Option<usize> {
         self.timestamp_index
     }
 
-    #[inline]
     pub fn timestamp_column(&self) -> Option<&ColumnSchema> {
         self.timestamp_index.map(|idx| &self.column_schemas[idx])
     }
 
-    #[inline]
     pub fn version(&self) -> u32 {
         self.version
     }
 
-    #[inline]
     pub fn metadata(&self) -> &HashMap<String, String> {
         &self.arrow_schema.metadata
+    }
+
+    /// Generate a new projected schema
+    ///
+    /// # Panic
+    ///
+    /// If the index out ouf bound
+    pub fn try_project(&self, indices: &[usize]) -> Result<Self> {
+        let mut column_schemas = Vec::with_capacity(indices.len());
+        let mut timestamp_index = None;
+        for index in indices {
+            if let Some(ts_index) = self.timestamp_index
+                && ts_index == *index
+            {
+                timestamp_index = Some(column_schemas.len());
+            }
+            column_schemas.push(self.column_schemas[*index].clone());
+        }
+        let arrow_schema = self
+            .arrow_schema
+            .project(indices)
+            .context(ProjectArrowSchemaSnafu)?;
+        let name_to_index = column_schemas
+            .iter()
+            .enumerate()
+            .map(|(pos, column_schema)| (column_schema.name.clone(), pos))
+            .collect();
+
+        Ok(Self {
+            column_schemas,
+            name_to_index,
+            arrow_schema: Arc::new(arrow_schema),
+            timestamp_index,
+            version: self.version,
+        })
     }
 }
 
@@ -181,7 +215,7 @@ impl SchemaBuilder {
     ///
     /// Old metadata with same key would be overwritten.
     pub fn add_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.insert(key.into(), value.into());
+        let _ = self.metadata.insert(key.into(), value.into());
         self
     }
 
@@ -216,19 +250,19 @@ fn collect_fields(column_schemas: &[ColumnSchema]) -> Result<FieldsAndIndices> {
     let mut name_to_index = HashMap::with_capacity(column_schemas.len());
     let mut timestamp_index = None;
     for (index, column_schema) in column_schemas.iter().enumerate() {
-        if column_schema.is_time_index() {
-            ensure!(
-                timestamp_index.is_none(),
-                error::DuplicateTimestampIndexSnafu {
-                    exists: timestamp_index.unwrap(),
-                    new: index,
-                }
-            );
+        if column_schema.is_time_index() && timestamp_index.is_none() {
             timestamp_index = Some(index);
         }
         let field = Field::try_from(column_schema)?;
         fields.push(field);
-        name_to_index.insert(column_schema.name.clone(), index);
+        ensure!(
+            name_to_index
+                .insert(column_schema.name.clone(), index)
+                .is_none(),
+            DuplicateColumnSnafu {
+                column: &column_schema.name,
+            }
+        );
     }
 
     Ok(FieldsAndIndices {
@@ -248,7 +282,7 @@ fn validate_timestamp_index(column_schemas: &[ColumnSchema], timestamp_index: us
 
     let column_schema = &column_schemas[timestamp_index];
     ensure!(
-        column_schema.data_type.is_timestamp_compatible(),
+        column_schema.data_type.is_timestamp(),
         error::InvalidTimestampIndexSnafu {
             index: timestamp_index,
         }
@@ -272,8 +306,8 @@ impl TryFrom<Arc<ArrowSchema>> for Schema {
         let mut column_schemas = Vec::with_capacity(arrow_schema.fields.len());
         let mut name_to_index = HashMap::with_capacity(arrow_schema.fields.len());
         for field in &arrow_schema.fields {
-            let column_schema = ColumnSchema::try_from(field)?;
-            name_to_index.insert(field.name().to_string(), column_schemas.len());
+            let column_schema = ColumnSchema::try_from(field.as_ref())?;
+            let _ = name_to_index.insert(field.name().to_string(), column_schemas.len());
             column_schemas.push(column_schema);
         }
 
@@ -281,14 +315,8 @@ impl TryFrom<Arc<ArrowSchema>> for Schema {
         for (index, column_schema) in column_schemas.iter().enumerate() {
             if column_schema.is_time_index() {
                 validate_timestamp_index(&column_schemas, index)?;
-                ensure!(
-                    timestamp_index.is_none(),
-                    error::DuplicateTimestampIndexSnafu {
-                        exists: timestamp_index.unwrap(),
-                        new: index,
-                    }
-                );
                 timestamp_index = Some(index);
+                break;
             }
         }
 
@@ -371,6 +399,21 @@ mod tests {
 
         assert_eq!(schema, new_schema);
         assert_eq!(column_schemas, schema.column_schemas());
+    }
+
+    #[test]
+    fn test_schema_duplicate_column() {
+        let column_schemas = vec![
+            ColumnSchema::new("col1", ConcreteDataType::int32_datatype(), false),
+            ColumnSchema::new("col1", ConcreteDataType::float64_datatype(), true),
+        ];
+        let err = Schema::try_new(column_schemas).unwrap_err();
+
+        assert!(
+            matches!(err, Error::DuplicateColumn { .. }),
+            "expect DuplicateColumn, found {}",
+            err
+        );
     }
 
     #[test]

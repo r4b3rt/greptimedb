@@ -25,8 +25,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{Array, PrimitiveArray};
+    use arrow_array::ArrayRef;
     use common_time::DateTime;
-    use datafusion_common::from_slice::FromSlice;
 
     use super::*;
     use crate::data_type::DataType;
@@ -37,7 +37,8 @@ mod tests {
 
     #[test]
     fn test_datetime_vector() {
-        let v = DateTimeVector::new(PrimitiveArray::from_slice([1, 2, 3]));
+        std::env::set_var("TZ", "Asia/Shanghai");
+        let v = DateTimeVector::new(PrimitiveArray::from(vec![1000, 2000, 3000]));
         assert_eq!(ConcreteDataType::datetime_datatype(), v.data_type());
         assert_eq!(3, v.len());
         assert_eq!("DateTimeVector", v.vector_type_name());
@@ -46,24 +47,24 @@ mod tests {
             v.to_arrow_array().data_type()
         );
 
-        assert_eq!(Some(DateTime::new(1)), v.get_data(0));
-        assert_eq!(Value::DateTime(DateTime::new(1)), v.get(0));
-        assert_eq!(ValueRef::DateTime(DateTime::new(1)), v.get_ref(0));
+        assert_eq!(Some(DateTime::new(1000)), v.get_data(0));
+        assert_eq!(Value::DateTime(DateTime::new(1000)), v.get(0));
+        assert_eq!(ValueRef::DateTime(DateTime::new(1000)), v.get_ref(0));
 
         let mut iter = v.iter_data();
-        assert_eq!(Some(DateTime::new(1)), iter.next().unwrap());
-        assert_eq!(Some(DateTime::new(2)), iter.next().unwrap());
-        assert_eq!(Some(DateTime::new(3)), iter.next().unwrap());
+        assert_eq!(Some(DateTime::new(1000)), iter.next().unwrap());
+        assert_eq!(Some(DateTime::new(2000)), iter.next().unwrap());
+        assert_eq!(Some(DateTime::new(3000)), iter.next().unwrap());
         assert!(!v.is_null(0));
-        assert_eq!(64, v.memory_size());
+        assert_eq!(24, v.memory_size());
 
         if let Value::DateTime(d) = v.get(0) {
-            assert_eq!(1, d.val());
+            assert_eq!(1000, d.val());
         } else {
             unreachable!()
         }
         assert_eq!(
-            "[\"1970-01-01 00:00:01\",\"1970-01-01 00:00:02\",\"1970-01-01 00:00:03\"]",
+            "[\"1970-01-01 08:00:01+0800\",\"1970-01-01 08:00:02+0800\",\"1970-01-01 08:00:03+0800\"]",
             serde_json::to_string(&v.serialize_to_json().unwrap()).unwrap()
         );
     }
@@ -81,24 +82,22 @@ mod tests {
         assert_eq!(Value::Null, v.get(1));
         assert_eq!(Value::DateTime(DateTime::new(-1)), v.get(2));
 
-        let input = DateTimeVector::from_wrapper_slice(&[
+        let input = DateTimeVector::from_wrapper_slice([
             DateTime::new(1),
             DateTime::new(2),
             DateTime::new(3),
         ]);
 
-        let mut builder = DateTimeType::default().create_mutable_vector(3);
-        builder
-            .push_value_ref(ValueRef::DateTime(DateTime::new(5)))
-            .unwrap();
-        assert!(builder.push_value_ref(ValueRef::Int32(123)).is_err());
+        let mut builder = DateTimeType.create_mutable_vector(3);
+        builder.push_value_ref(ValueRef::DateTime(DateTime::new(5)));
+        assert!(builder.try_push_value_ref(ValueRef::Int32(123)).is_err());
         builder.extend_slice_of(&input, 1, 2).unwrap();
         assert!(builder
-            .extend_slice_of(&crate::vectors::Int32Vector::from_slice(&[13]), 0, 1)
+            .extend_slice_of(&crate::vectors::Int32Vector::from_slice([13]), 0, 1)
             .is_err());
         let vector = builder.to_vector();
 
-        let expect: VectorRef = Arc::new(DateTimeVector::from_wrapper_slice(&[
+        let expect: VectorRef = Arc::new(DateTimeVector::from_wrapper_slice([
             DateTime::new(5),
             DateTime::new(2),
             DateTime::new(3),
@@ -108,9 +107,9 @@ mod tests {
 
     #[test]
     fn test_datetime_from_arrow() {
-        let vector = DateTimeVector::from_wrapper_slice(&[DateTime::new(1), DateTime::new(2)]);
-        let arrow = vector.as_arrow().slice(0, vector.len());
-        let vector2 = DateTimeVector::try_from_arrow_array(&arrow).unwrap();
+        let vector = DateTimeVector::from_wrapper_slice([DateTime::new(1), DateTime::new(2)]);
+        let arrow: ArrayRef = Arc::new(vector.as_arrow().slice(0, vector.len())) as _;
+        let vector2 = DateTimeVector::try_from_arrow_array(arrow).unwrap();
         assert_eq!(vector, vector2);
     }
 }

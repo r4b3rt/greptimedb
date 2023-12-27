@@ -14,14 +14,15 @@
 
 #![feature(assert_matches)]
 
+pub mod alive_keeper;
+pub mod config;
 pub mod datanode;
 pub mod error;
-mod heartbeat;
-pub mod instance;
-mod metric;
-mod mock;
-mod script;
-pub mod server;
-pub mod sql;
+pub mod event_listener;
+mod greptimedb_telemetry;
+pub mod heartbeat;
+pub mod metrics;
+pub mod region_server;
+mod store;
 #[cfg(test)]
 mod tests;

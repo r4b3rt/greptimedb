@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::column::SemanticType;
-use api::v1::{column, Column, ColumnDataType, InsertRequest as GrpcInsertRequest};
+use api::v1::{column, Column, ColumnDataType, InsertRequest as GrpcInsertRequest, SemanticType};
 
 use crate::error::{self, Result};
 
 pub const OPENTSDB_TIMESTAMP_COLUMN_NAME: &str = "greptime_timestamp";
-pub const OPENTSDB_VALUE_COLUMN_NAME: &str = "greptime_value";
+pub const OPENTSDB_FIELD_COLUMN_NAME: &str = "greptime_value";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataPoint {
     metric: String,
     ts_millis: i64,
@@ -116,6 +115,10 @@ impl DataPoint {
         &self.tags
     }
 
+    pub fn tags_mut(&mut self) -> &mut Vec<(String, String)> {
+        &mut self.tags
+    }
+
     pub fn ts_millis(&self) -> i64 {
         self.ts_millis
     }
@@ -130,7 +133,7 @@ impl DataPoint {
         let ts_column = Column {
             column_name: OPENTSDB_TIMESTAMP_COLUMN_NAME.to_string(),
             values: Some(column::Values {
-                ts_millisecond_values: vec![self.ts_millis],
+                timestamp_millisecond_values: vec![self.ts_millis],
                 ..Default::default()
             }),
             semantic_type: SemanticType::Timestamp as i32,
@@ -139,8 +142,8 @@ impl DataPoint {
         };
         columns.push(ts_column);
 
-        let value_column = Column {
-            column_name: OPENTSDB_VALUE_COLUMN_NAME.to_string(),
+        let field_column = Column {
+            column_name: OPENTSDB_FIELD_COLUMN_NAME.to_string(),
             values: Some(column::Values {
                 f64_values: vec![self.value],
                 ..Default::default()
@@ -149,7 +152,7 @@ impl DataPoint {
             datatype: ColumnDataType::Float64 as i32,
             ..Default::default()
         };
-        columns.push(value_column);
+        columns.push(field_column);
 
         for (tagk, tagv) in self.tags.iter() {
             columns.push(Column {
@@ -166,7 +169,6 @@ impl DataPoint {
 
         GrpcInsertRequest {
             table_name: self.metric.clone(),
-            region_number: 0,
             columns,
             row_count: 1,
         }
@@ -269,11 +271,15 @@ mod test {
 
         assert_eq!(columns[0].column_name, OPENTSDB_TIMESTAMP_COLUMN_NAME);
         assert_eq!(
-            columns[0].values.as_ref().unwrap().ts_millisecond_values,
+            columns[0]
+                .values
+                .as_ref()
+                .unwrap()
+                .timestamp_millisecond_values,
             vec![1000]
         );
 
-        assert_eq!(columns[1].column_name, OPENTSDB_VALUE_COLUMN_NAME);
+        assert_eq!(columns[1].column_name, OPENTSDB_FIELD_COLUMN_NAME);
         assert_eq!(columns[1].values.as_ref().unwrap().f64_values, vec![1.0]);
 
         assert_eq!(columns[2].column_name, "tagk1");

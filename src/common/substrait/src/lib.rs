@@ -14,28 +14,31 @@
 
 #![feature(let_chains)]
 
-mod context;
-mod df_expr;
-mod df_logical;
+mod df_substrait;
 pub mod error;
-mod schema;
-mod types;
+pub mod extension_serializer;
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use catalog::CatalogManagerRef;
+use datafusion::catalog::CatalogList;
 
-pub use crate::df_logical::DFLogicalSubstraitConvertor;
+pub use crate::df_substrait::DFLogicalSubstraitConvertor;
 
+#[async_trait]
 pub trait SubstraitPlan {
     type Error: std::error::Error;
 
     type Plan;
 
-    fn decode<B: Buf + Send>(
+    async fn decode<B: Buf + Send>(
         &self,
         message: B,
-        catalog_manager: CatalogManagerRef,
+        catalog_list: Arc<dyn CatalogList>,
+        catalog: &str,
+        schema: &str,
     ) -> Result<Self::Plan, Self::Error>;
 
-    fn encode(&self, plan: Self::Plan) -> Result<Bytes, Self::Error>;
+    fn encode(&self, plan: &Self::Plan) -> Result<Bytes, Self::Error>;
 }

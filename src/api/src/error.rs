@@ -15,44 +15,43 @@
 use std::any::Any;
 
 use common_error::ext::ErrorExt;
-use common_error::prelude::StatusCode;
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use datatypes::prelude::ConcreteDataType;
 use snafu::prelude::*;
-use snafu::{Backtrace, ErrorCompat};
+use snafu::Location;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
     #[snafu(display("Unknown proto column datatype: {}", datatype))]
-    UnknownColumnDataType { datatype: i32, backtrace: Backtrace },
+    UnknownColumnDataType {
+        datatype: i32,
+        location: Location,
+        #[snafu(source)]
+        error: prost::DecodeError,
+    },
 
     #[snafu(display("Failed to create column datatype from {:?}", from))]
     IntoColumnDataType {
         from: ConcreteDataType,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display(
-        "Failed to convert column default constraint, column: {}, source: {}",
-        column,
-        source
-    ))]
+    #[snafu(display("Failed to convert column default constraint, column: {}", column))]
     ConvertColumnDefaultConstraint {
         column: String,
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
     },
 
-    #[snafu(display(
-        "Invalid column default constraint, column: {}, source: {}",
-        column,
-        source
-    ))]
+    #[snafu(display("Invalid column default constraint, column: {}", column))]
     InvalidColumnDefaultConstraint {
         column: String,
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
     },
 }
@@ -65,9 +64,6 @@ impl ErrorExt for Error {
             Error::ConvertColumnDefaultConstraint { source, .. }
             | Error::InvalidColumnDefaultConstraint { source, .. } => source.status_code(),
         }
-    }
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {

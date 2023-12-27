@@ -12,21 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(error_iter)]
+
 pub mod ext;
 pub mod format;
 pub mod mock;
 pub mod status_code;
 
-pub mod prelude {
-    pub use snafu::prelude::*;
-    pub use snafu::{Backtrace, ErrorCompat};
-
-    pub use crate::ext::{BoxedError, ErrorExt};
-    pub use crate::format::DebugFormat;
-    pub use crate::status_code::StatusCode;
-
-    pub const INNER_ERROR_CODE: &str = "INNER_ERROR_CODE";
-    pub const INNER_ERROR_MSG: &str = "INNER_ERROR_MSG";
-}
+pub const GREPTIME_ERROR_CODE: &str = "x-greptime-err-code";
+pub const GREPTIME_ERROR_MSG: &str = "x-greptime-err-msg";
 
 pub use snafu;

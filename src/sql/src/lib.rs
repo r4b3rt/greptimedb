@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(box_patterns)]
 #![feature(assert_matches)]
+#![feature(let_chains)]
+#![feature(lazy_cell)]
 
 pub mod ast;
 pub mod dialect;
@@ -20,3 +23,8 @@ pub mod error;
 pub mod parser;
 pub mod parsers;
 pub mod statements;
+pub mod util;
+
+pub use parsers::create_parser::{ENGINE, MAXVALUE};
+pub use parsers::tql_parser::TQL;
+pub use statements::create::TIME_INDEX;

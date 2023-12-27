@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 
 use common_recordbatch::adapter::{DfRecordBatchStreamAdapter, RecordBatchStreamAdapter};
@@ -22,8 +22,9 @@ use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
 use datafusion::error::Result as DfResult;
 pub use datafusion::execution::context::{SessionContext, TaskContext};
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 pub use datafusion::physical_plan::Partitioning;
-use datafusion::physical_plan::Statistics;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Statistics};
 use datatypes::schema::SchemaRef;
 use snafu::ResultExt;
 
@@ -32,12 +33,12 @@ use crate::DfPhysicalPlan;
 
 pub type PhysicalPlanRef = Arc<dyn PhysicalPlan>;
 
-/// `PhysicalPlan` represent nodes in the Physical Plan.
+/// [`PhysicalPlan`] represent nodes in the Physical Plan.
 ///
-/// Each `PhysicalPlan` is Partition-aware and is responsible for
-/// creating the actual `async` [`SendableRecordBatchStream`]s
-/// of [`RecordBatch`] that incrementally compute the operator's
-/// output from its input partition.
+/// Each [`PhysicalPlan`] is partition-aware and is responsible for
+/// creating the actual "async" [`SendableRecordBatchStream`]s
+/// of [`RecordBatch`](common_recordbatch::RecordBatch) that incrementally
+/// compute the operator's  output from its input partition.
 pub trait PhysicalPlan: Debug + Send + Sync {
     /// Returns the physical plan as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
@@ -49,13 +50,18 @@ pub trait PhysicalPlan: Debug + Send + Sync {
     /// Specifies the output partitioning scheme of this plan
     fn output_partitioning(&self) -> Partitioning;
 
+    /// returns `Some(keys)` that describes how the output was sorted.
+    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+        None
+    }
+
     /// Get a list of child physical plans that provide the input for this plan. The returned list
     /// will be empty for leaf nodes, will contain a single value for unary nodes, or two
     /// values for binary nodes (such as joins).
     fn children(&self) -> Vec<PhysicalPlanRef>;
 
     /// Returns a new plan where all children were replaced by new plans.
-    /// The size of `children` must be equal to the size of `PhysicalPlan::children()`.
+    /// The size of `children` must be equal to the size of [`PhysicalPlan::children()`].
     fn with_new_children(&self, children: Vec<PhysicalPlanRef>) -> Result<PhysicalPlanRef>;
 
     /// Creates an RecordBatch stream.
@@ -64,17 +70,27 @@ pub trait PhysicalPlan: Debug + Send + Sync {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream>;
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
 }
 
+/// Adapt DataFusion's [`ExecutionPlan`](DfPhysicalPlan) to GreptimeDB's [`PhysicalPlan`].
 #[derive(Debug)]
 pub struct PhysicalPlanAdapter {
     schema: SchemaRef,
     df_plan: Arc<dyn DfPhysicalPlan>,
+    metric: ExecutionPlanMetricsSet,
 }
 
 impl PhysicalPlanAdapter {
     pub fn new(schema: SchemaRef, df_plan: Arc<dyn DfPhysicalPlan>) -> Self {
-        Self { schema, df_plan }
+        Self {
+            schema,
+            df_plan,
+            metric: ExecutionPlanMetricsSet::new(),
+        }
     }
 
     pub fn df_plan(&self) -> Arc<dyn DfPhysicalPlan> {
@@ -121,14 +137,20 @@ impl PhysicalPlan for PhysicalPlanAdapter {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metric = BaselineMetrics::new(&self.metric, partition);
+
         let df_plan = self.df_plan.clone();
         let stream = df_plan
             .execute(partition, context)
             .context(error::GeneralDataFusionSnafu)?;
-        let adapter = RecordBatchStreamAdapter::try_new(stream)
+        let adapter = RecordBatchStreamAdapter::try_new_with_metrics(stream, baseline_metric)
             .context(error::ConvertDfRecordBatchStreamSnafu)?;
 
         Ok(Box::pin(adapter))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.df_plan.metrics()
     }
 }
 
@@ -149,7 +171,7 @@ impl DfPhysicalPlan for DfPhysicalPlanAdapter {
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+        self.0.output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn DfPhysicalPlan>> {
@@ -188,8 +210,17 @@ impl DfPhysicalPlan for DfPhysicalPlanAdapter {
     }
 
     fn statistics(&self) -> Statistics {
-        // TODO(LFC): impl statistics
         Statistics::default()
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.0.metrics()
+    }
+}
+
+impl DisplayAs for DfPhysicalPlanAdapter {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.0)
     }
 }
 
@@ -315,7 +346,11 @@ mod test {
                 .unwrap()
                 .build()
                 .unwrap();
-        let physical_plan = ctx.create_physical_plan(&logical_plan).await.unwrap();
+        let physical_plan = ctx
+            .state()
+            .create_physical_plan(&logical_plan)
+            .await
+            .unwrap();
         let df_recordbatches = collect(physical_plan, Arc::new(TaskContext::from(&ctx)))
             .await
             .unwrap();
@@ -344,7 +379,7 @@ mod test {
             Arc::new(Schema::try_from(df_schema.clone()).unwrap()),
             Arc::new(EmptyExec::new(true, df_schema.clone())),
         );
-        assert!(plan.df_plan.as_any().downcast_ref::<EmptyExec>().is_some());
+        let _ = plan.df_plan.as_any().downcast_ref::<EmptyExec>().unwrap();
 
         let df_plan = DfPhysicalPlanAdapter(Arc::new(plan));
         assert_eq!(df_schema, df_plan.schema());

@@ -14,7 +14,7 @@
 
 use std::pin::Pin;
 
-use common_error::prelude::ErrorExt;
+use common_error::ext::ErrorExt;
 use futures::Stream;
 
 use crate::logstore::entry::Entry;
@@ -33,7 +33,9 @@ mod tests {
     use std::any::Any;
     use std::task::{Context, Poll};
 
+    use common_error::ext::StackError;
     use futures::StreamExt;
+    use snafu::Snafu;
 
     use super::*;
     pub use crate::logstore::entry::Id;
@@ -42,9 +44,6 @@ mod tests {
         /// Binary data of current entry
         data: Vec<u8>,
     }
-
-    use common_error::prelude::{ErrorExt, Snafu};
-    use snafu::{Backtrace, ErrorCompat};
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub))]
@@ -60,12 +59,16 @@ mod tests {
     }
 
     impl ErrorExt for Error {
-        fn backtrace_opt(&self) -> Option<&Backtrace> {
-            ErrorCompat::backtrace(self)
-        }
-
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    impl StackError for Error {
+        fn debug_fmt(&self, _: usize, _: &mut Vec<String>) {}
+
+        fn next(&self) -> Option<&dyn StackError> {
+            None
         }
     }
 
@@ -122,7 +125,7 @@ mod tests {
     #[tokio::test]
     pub async fn test_entry_stream() {
         let stream =
-            async_stream::stream!({ yield Ok(vec![SimpleEntry::new("test_entry".as_bytes())]) });
+            async_stream::stream!(yield Ok(vec![SimpleEntry::new("test_entry".as_bytes())]));
 
         let mut stream_impl = EntryStreamImpl {
             inner: Box::pin(stream),

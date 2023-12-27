@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayData, ArrayRef, BooleanBufferBuilder, Int32BufferBuilder, ListArray,
 };
-use arrow::buffer::Buffer;
+use arrow::buffer::{Buffer, NullBuffer};
 use arrow::datatypes::DataType as ArrowDataType;
 use serde_json::Value as JsonValue;
 
@@ -46,17 +46,6 @@ impl ListVector {
             .map(|value_opt| value_opt.map(Helper::try_into_vector).transpose())
     }
 
-    fn to_array_data(&self) -> ArrayData {
-        self.array.data().clone()
-    }
-
-    fn from_array_data_and_type(data: ArrayData, item_type: ConcreteDataType) -> Self {
-        Self {
-            array: ListArray::from(data),
-            item_type,
-        }
-    }
-
     pub(crate) fn as_arrow(&self) -> &dyn Array {
         &self.array
     }
@@ -80,13 +69,11 @@ impl Vector for ListVector {
     }
 
     fn to_arrow_array(&self) -> ArrayRef {
-        let data = self.to_array_data();
-        Arc::new(ListArray::from(data))
+        Arc::new(self.array.clone())
     }
 
     fn to_boxed_arrow_array(&self) -> Box<dyn Array> {
-        let data = self.to_array_data();
-        Box::new(ListArray::from(data))
+        Box::new(self.array.clone())
     }
 
     fn validity(&self) -> Validity {
@@ -106,8 +93,10 @@ impl Vector for ListVector {
     }
 
     fn slice(&self, offset: usize, length: usize) -> VectorRef {
-        let data = self.array.data().slice(offset, length);
-        Arc::new(Self::from_array_data_and_type(data, self.item_type.clone()))
+        Arc::new(Self {
+            array: self.array.slice(offset, length),
+            item_type: self.item_type.clone(),
+        })
     }
 
     fn get(&self, index: usize) -> Value {
@@ -258,14 +247,11 @@ impl ListVectorBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    fn push_null(&mut self) {
-        self.finish_list(false);
-    }
-
     fn push_list_value(&mut self, list_value: &ListValue) -> Result<()> {
         if let Some(items) = list_value.items() {
             for item in &**items {
-                self.values_builder.push_value_ref(item.as_value_ref())?;
+                self.values_builder
+                    .try_push_value_ref(item.as_value_ref())?;
             }
         }
 
@@ -295,7 +281,11 @@ impl MutableVector for ListVectorBuilder {
         Arc::new(self.finish())
     }
 
-    fn push_value_ref(&mut self, value: ValueRef) -> Result<()> {
+    fn to_vector_cloned(&self) -> VectorRef {
+        Arc::new(self.finish_cloned())
+    }
+
+    fn try_push_value_ref(&mut self, value: ValueRef) -> Result<()> {
         if let Some(list_ref) = value.as_list()? {
             match list_ref {
                 ListValueRef::Indexed { vector, idx } => match vector.get(idx).as_list()? {
@@ -314,10 +304,14 @@ impl MutableVector for ListVectorBuilder {
     fn extend_slice_of(&mut self, vector: &dyn Vector, offset: usize, length: usize) -> Result<()> {
         for idx in offset..offset + length {
             let value = vector.get_ref(idx);
-            self.push_value_ref(value)?;
+            self.try_push_value_ref(value)?;
         }
 
         Ok(())
+    }
+
+    fn push_null(&mut self) {
+        self.finish_list(false);
     }
 }
 
@@ -332,7 +326,7 @@ impl ScalarVectorBuilder for ListVectorBuilder {
         // We expect the input ListValue has the same inner type as the builder when using
         // push(), so just panic if `push_value_ref()` returns error, which indicate an
         // invalid input value type.
-        self.push_value_ref(value.into()).unwrap_or_else(|e| {
+        self.try_push_value_ref(value.into()).unwrap_or_else(|e| {
             panic!(
                 "Failed to push value, expect value type {:?}, err:{}",
                 self.item_type, e
@@ -344,7 +338,7 @@ impl ScalarVectorBuilder for ListVectorBuilder {
         let len = self.len();
         let values_vector = self.values_builder.to_vector();
         let values_arr = values_vector.to_arrow_array();
-        let values_data = values_arr.data();
+        let values_data = values_arr.to_data();
 
         let offset_buffer = self.offsets_builder.finish();
         let null_bit_buffer = self.null_buffer_builder.finish();
@@ -354,8 +348,34 @@ impl ScalarVectorBuilder for ListVectorBuilder {
         let array_data_builder = ArrayData::builder(data_type)
             .len(len)
             .add_buffer(offset_buffer)
-            .add_child_data(values_data.clone())
+            .add_child_data(values_data)
             .null_bit_buffer(null_bit_buffer);
+
+        let array_data = unsafe { array_data_builder.build_unchecked() };
+        let array = ListArray::from(array_data);
+
+        ListVector {
+            array,
+            item_type: self.item_type.clone(),
+        }
+    }
+
+    // Port from https://github.com/apache/arrow-rs/blob/ef6932f31e243d8545e097569653c8d3f1365b4d/arrow-array/src/builder/generic_list_builder.rs#L302-L325
+    fn finish_cloned(&self) -> Self::VectorType {
+        let len = self.len();
+        let values_vector = self.values_builder.to_vector_cloned();
+        let values_arr = values_vector.to_arrow_array();
+        let values_data = values_arr.to_data();
+
+        let offset_buffer = Buffer::from_slice_ref(self.offsets_builder.as_slice());
+        let nulls = self.null_buffer_builder.finish_cloned();
+
+        let data_type = ConcreteDataType::list_datatype(self.item_type.clone()).as_arrow_type();
+        let array_data_builder = ArrayData::builder(data_type)
+            .len(len)
+            .add_buffer(offset_buffer)
+            .add_child_data(values_data)
+            .nulls(nulls);
 
         let array_data = unsafe { array_data_builder.build_unchecked() };
         let array = ListArray::from(array_data);
@@ -432,10 +452,15 @@ impl NullBufferBuilder {
     /// Builds the null buffer and resets the builder.
     /// Returns `None` if the builder only contains `true`s.
     fn finish(&mut self) -> Option<Buffer> {
-        let buf = self.bitmap_builder.as_mut().map(|b| b.finish());
-        self.bitmap_builder = None;
+        let buf = self.bitmap_builder.take().map(Into::into);
         self.len = 0;
         buf
+    }
+
+    /// Builds the [NullBuffer] without resetting the builder.
+    fn finish_cloned(&self) -> Option<NullBuffer> {
+        let buffer = self.bitmap_builder.as_ref()?.finish_cloned();
+        Some(NullBuffer::new(buffer))
     }
 
     #[inline]
@@ -623,7 +648,7 @@ pub mod tests {
         );
         let mut iter = list_vector.values_iter();
         assert_eq!(
-            Arc::new(Int32Vector::from_slice(&[1, 2, 3])) as VectorRef,
+            Arc::new(Int32Vector::from_slice([1, 2, 3])) as VectorRef,
             *iter.next().unwrap().unwrap().unwrap()
         );
         assert!(iter.next().unwrap().unwrap().is_none());
@@ -653,19 +678,17 @@ pub mod tests {
     fn test_list_vector_builder() {
         let mut builder =
             ListType::new(ConcreteDataType::int32_datatype()).create_mutable_vector(3);
-        builder
-            .push_value_ref(ValueRef::List(ListValueRef::Ref {
-                val: &ListValue::new(
-                    Some(Box::new(vec![
-                        Value::Int32(4),
-                        Value::Null,
-                        Value::Int32(6),
-                    ])),
-                    ConcreteDataType::int32_datatype(),
-                ),
-            }))
-            .unwrap();
-        assert!(builder.push_value_ref(ValueRef::Int32(123)).is_err());
+        builder.push_value_ref(ValueRef::List(ListValueRef::Ref {
+            val: &ListValue::new(
+                Some(Box::new(vec![
+                    Value::Int32(4),
+                    Value::Null,
+                    Value::Int32(6),
+                ])),
+                ConcreteDataType::int32_datatype(),
+            ),
+        }));
+        assert!(builder.try_push_value_ref(ValueRef::Int32(123)).is_err());
 
         let data = vec![
             Some(vec![Some(1), Some(2), Some(3)]),
@@ -675,7 +698,7 @@ pub mod tests {
         let input = new_list_vector(&data);
         builder.extend_slice_of(&input, 1, 2).unwrap();
         assert!(builder
-            .extend_slice_of(&crate::vectors::Int32Vector::from_slice(&[13]), 0, 1)
+            .extend_slice_of(&crate::vectors::Int32Vector::from_slice([13]), 0, 1)
             .is_err());
         let vector = builder.to_vector();
 
@@ -740,5 +763,25 @@ pub mod tests {
             },
             iter.nth(1).unwrap().unwrap()
         );
+    }
+
+    #[test]
+    fn test_list_vector_builder_finish_cloned() {
+        let mut builder =
+            ListVectorBuilder::with_type_capacity(ConcreteDataType::int32_datatype(), 2);
+        builder.push(None);
+        builder.push(Some(ListValueRef::Ref {
+            val: &ListValue::new(
+                Some(Box::new(vec![
+                    Value::Int32(4),
+                    Value::Null,
+                    Value::Int32(6),
+                ])),
+                ConcreteDataType::int32_datatype(),
+            ),
+        }));
+        let vector = builder.finish_cloned();
+        assert_eq!(vector.len(), 2);
+        assert_eq!(builder.len(), 2);
     }
 }

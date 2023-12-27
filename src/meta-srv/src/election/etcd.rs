@@ -16,11 +16,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common_telemetry::{info, warn};
+use common_meta::distributed_time_constants::{META_KEEP_ALIVE_INTERVAL_SECS, META_LEASE_SECS};
+use common_telemetry::{error, info, warn};
 use etcd_client::Client;
 use snafu::{OptionExt, ResultExt};
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::Receiver;
 
-use crate::election::{Election, ELECTION_KEY, KEEP_ALIVE_PERIOD_SECS, LEASE_SECS};
+use crate::election::{Election, LeaderChangeMessage, ELECTION_KEY};
 use crate::error;
 use crate::error::Result;
 use crate::metasrv::{ElectionRef, LeaderValue};
@@ -30,25 +34,81 @@ pub struct EtcdElection {
     client: Client,
     is_leader: AtomicBool,
     infancy: AtomicBool,
+    leader_watcher: broadcast::Sender<LeaderChangeMessage>,
+    store_key_prefix: Option<String>,
 }
 
 impl EtcdElection {
-    pub async fn with_endpoints<E, S>(leader_value: E, endpoints: S) -> Result<ElectionRef>
+    pub async fn with_endpoints<E, S>(
+        leader_value: E,
+        endpoints: S,
+        store_key_prefix: Option<String>,
+    ) -> Result<ElectionRef>
     where
         E: AsRef<str>,
         S: AsRef<[E]>,
     {
-        let leader_value = leader_value.as_ref().into();
         let client = Client::connect(endpoints, None)
             .await
             .context(error::ConnectEtcdSnafu)?;
+
+        Self::with_etcd_client(leader_value, client, store_key_prefix).await
+    }
+
+    pub async fn with_etcd_client<E>(
+        leader_value: E,
+        client: Client,
+        store_key_prefix: Option<String>,
+    ) -> Result<ElectionRef>
+    where
+        E: AsRef<str>,
+    {
+        let leader_value: String = leader_value.as_ref().into();
+
+        let leader_ident = leader_value.clone();
+        let (tx, mut rx) = broadcast::channel(100);
+        let _handle = common_runtime::spawn_bg(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => match msg {
+                        LeaderChangeMessage::Elected(key) => {
+                            info!(
+                                "[{leader_ident}] is elected as leader: {:?}, lease: {}",
+                                key.name_str(),
+                                key.lease()
+                            );
+                        }
+                        LeaderChangeMessage::StepDown(key) => {
+                            warn!(
+                                "[{leader_ident}] is stepping down: {:?}, lease: {}",
+                                key.name_str(),
+                                key.lease()
+                            );
+                        }
+                    },
+                    Err(RecvError::Lagged(_)) => {
+                        warn!("Log printing is too slow or leader changed too fast!");
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
 
         Ok(Arc::new(Self {
             leader_value,
             client,
             is_leader: AtomicBool::new(false),
             infancy: AtomicBool::new(false),
+            leader_watcher: tx,
+            store_key_prefix,
         }))
+    }
+
+    fn election_key(&self) -> String {
+        match &self.store_key_prefix {
+            Some(prefix) => format!("{}{}", prefix, ELECTION_KEY),
+            None => ELECTION_KEY.to_string(),
+        }
     }
 }
 
@@ -70,7 +130,7 @@ impl Election for EtcdElection {
         let mut lease_client = self.client.lease_client();
         let mut election_client = self.client.election_client();
         let res = lease_client
-            .grant(LEASE_SECS, None)
+            .grant(META_LEASE_SECS as i64, None)
             .await
             .context(error::EtcdFailedSnafu)?;
         let lease_id = res.id();
@@ -85,22 +145,20 @@ impl Election for EtcdElection {
         // to confirm that it is a valid leader, because it is possible that the
         // election's lease expires.
         let res = election_client
-            .campaign(ELECTION_KEY, self.leader_value.clone(), lease_id)
+            .campaign(self.election_key(), self.leader_value.clone(), lease_id)
             .await
             .context(error::EtcdFailedSnafu)?;
 
         if let Some(leader) = res.leader() {
-            let (mut keeper, mut receiver) = self
-                .client
-                .lease_client()
+            let (mut keeper, mut receiver) = lease_client
                 .keep_alive(lease_id)
                 .await
                 .context(error::EtcdFailedSnafu)?;
 
             let mut keep_alive_interval =
-                tokio::time::interval(Duration::from_secs(KEEP_ALIVE_PERIOD_SECS));
+                tokio::time::interval(Duration::from_secs(META_KEEP_ALIVE_INTERVAL_SECS));
             loop {
-                keep_alive_interval.tick().await;
+                let _ = keep_alive_interval.tick().await;
                 keeper.keep_alive().await.context(error::EtcdFailedSnafu)?;
 
                 if let Some(res) = receiver.message().await.context(error::EtcdFailedSnafu)? {
@@ -112,18 +170,23 @@ impl Election for EtcdElection {
                             .is_ok()
                         {
                             self.infancy.store(true, Ordering::Relaxed);
-                            info!(
-                                "[{}] becoming leader: {:?}, lease: {}",
-                                &self.leader_value,
-                                leader.name_str(),
-                                leader.lease()
-                            );
+
+                            if let Err(e) = self
+                                .leader_watcher
+                                .send(LeaderChangeMessage::Elected(Arc::new(leader.clone())))
+                            {
+                                error!("Failed to send leader change message, error: {e}");
+                            }
                         }
                     } else {
-                        warn!(
-                            "Failed to keep-alive, lease: {}, will re-initiate election",
-                            leader.lease()
-                        );
+                        if self.is_leader.load(Ordering::Relaxed) {
+                            if let Err(e) = self
+                                .leader_watcher
+                                .send(LeaderChangeMessage::StepDown(Arc::new(leader.clone())))
+                            {
+                                error!("Failed to send leader change message, error: {e}");
+                            }
+                        }
                         break;
                     }
                 }
@@ -142,7 +205,7 @@ impl Election for EtcdElection {
             let res = self
                 .client
                 .election_client()
-                .leader(ELECTION_KEY)
+                .leader(self.election_key())
                 .await
                 .context(error::EtcdFailedSnafu)?;
             let leader_value = res.kv().context(error::NoLeaderSnafu)?.value();
@@ -153,5 +216,9 @@ impl Election for EtcdElection {
 
     async fn resign(&self) -> Result<()> {
         todo!()
+    }
+
+    fn subscribe_leader_change(&self) -> Receiver<LeaderChangeMessage> {
+        self.leader_watcher.subscribe()
     }
 }

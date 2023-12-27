@@ -18,29 +18,37 @@ use async_trait::async_trait;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
-use datafusion::physical_plan::planner::ExtensionPlanner;
-use datafusion::physical_plan::{ExecutionPlan, PhysicalPlanner};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
-use super::{InstantManipulate, RangeManipulate};
-use crate::extension_plan::SeriesNormalize;
+use super::HistogramFold;
+use crate::extension_plan::{
+    EmptyMetric, InstantManipulate, RangeManipulate, SeriesDivide, SeriesNormalize,
+};
 
-pub struct PromExtensionPlanner {}
+pub struct PromExtensionPlanner;
 
 #[async_trait]
 impl ExtensionPlanner for PromExtensionPlanner {
     async fn plan_extension(
         &self,
-        _planner: &dyn PhysicalPlanner,
+        planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        session_state: &SessionState,
     ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(node) = node.as_any().downcast_ref::<SeriesNormalize>() {
             Ok(Some(node.to_execution_plan(physical_inputs[0].clone())))
         } else if let Some(node) = node.as_any().downcast_ref::<InstantManipulate>() {
             Ok(Some(node.to_execution_plan(physical_inputs[0].clone())))
         } else if let Some(node) = node.as_any().downcast_ref::<RangeManipulate>() {
+            Ok(Some(node.to_execution_plan(physical_inputs[0].clone())))
+        } else if let Some(node) = node.as_any().downcast_ref::<SeriesDivide>() {
+            Ok(Some(node.to_execution_plan(physical_inputs[0].clone())))
+        } else if let Some(node) = node.as_any().downcast_ref::<EmptyMetric>() {
+            Ok(Some(node.to_execution_plan(session_state, planner)?))
+        } else if let Some(node) = node.as_any().downcast_ref::<HistogramFold>() {
             Ok(Some(node.to_execution_plan(physical_inputs[0].clone())))
         } else {
             Ok(None)

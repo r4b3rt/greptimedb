@@ -16,12 +16,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use auth::tests::{DatabaseAuthInfo, MockUserProvider};
 use common_catalog::consts::DEFAULT_SCHEMA_NAME;
 use common_recordbatch::RecordBatch;
 use common_runtime::Builder as RuntimeBuilder;
-use datatypes::schema::Schema;
+use datatypes::prelude::VectorRef;
+use datatypes::schema::{ColumnSchema, Schema};
+use datatypes::value::Value;
 use mysql_async::prelude::*;
-use mysql_async::SslOpts;
+use mysql_async::{Conn, Row, SslOpts};
 use rand::rngs::StdRng;
 use rand::Rng;
 use servers::error::Result;
@@ -29,8 +32,8 @@ use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
 use servers::server::Server;
 use servers::tls::TlsOption;
 use table::test_util::MemTable;
+use table::TableRef;
 
-use crate::auth::{DatabaseAuthInfo, MockUserProvider};
 use crate::create_testing_sql_query_handler;
 use crate::mysql::{all_datatype_testing_data, MysqlTextRow, TestingData};
 
@@ -41,7 +44,7 @@ struct MysqlOpts<'a> {
     reject_no_database: bool,
 }
 
-fn create_mysql_server(table: MemTable, opts: MysqlOpts<'_>) -> Result<Box<dyn Server>> {
+fn create_mysql_server(table: TableRef, opts: MysqlOpts<'_>) -> Result<Box<dyn Server>> {
     let query_handler = create_testing_sql_query_handler(table);
     let io_runtime = Arc::new(
         RuntimeBuilder::default()
@@ -74,7 +77,7 @@ async fn test_start_mysql_server() -> Result<()> {
     let mysql_server = create_mysql_server(table, Default::default())?;
     let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
     let result = mysql_server.start(listening).await;
-    assert!(result.is_ok());
+    let _ = result.unwrap();
 
     let result = mysql_server.start(listening).await;
     assert!(result
@@ -101,10 +104,10 @@ async fn test_reject_no_database() -> Result<()> {
 
     let fail = create_connection(server_port, None, false).await;
     assert!(fail.is_err());
-    let pass = create_connection(server_port, Some("public"), false).await;
-    assert!(pass.is_ok());
-    let result = mysql_server.shutdown().await;
-    assert!(result.is_ok());
+    let _ = create_connection(server_port, Some("public"), false)
+        .await
+        .unwrap();
+    mysql_server.shutdown().await.unwrap();
 
     Ok(())
 }
@@ -133,10 +136,10 @@ async fn test_schema_validation() -> Result<()> {
     })
     .await?;
 
-    let pass = create_connection_default_db_name(server_port, false).await;
-    assert!(pass.is_ok());
-    let result = mysql_server.shutdown().await;
-    assert!(result.is_ok());
+    let _ = create_connection_default_db_name(server_port, false)
+        .await
+        .unwrap();
+    mysql_server.shutdown().await.unwrap();
 
     // change to another username
     let (mysql_server, server_port) = generate_server(DatabaseAuthInfo {
@@ -148,8 +151,7 @@ async fn test_schema_validation() -> Result<()> {
 
     let fail = create_connection_default_db_name(server_port, false).await;
     assert!(fail.is_err());
-    let result = mysql_server.shutdown().await;
-    assert!(result.is_ok());
+    mysql_server.shutdown().await.unwrap();
 
     Ok(())
 }
@@ -193,14 +195,12 @@ async fn test_shutdown_mysql_server() -> Result<()> {
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let result = mysql_server.shutdown().await;
-    assert!(result.is_ok());
+    mysql_server.shutdown().await.unwrap();
 
     for handle in join_handles.iter_mut() {
         let result = handle.await.unwrap();
         assert!(result.is_err());
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("Connection refused") || error.contains("Connection reset by peer"));
+        assert!(result.unwrap_err().is_fatal());
     }
     Ok(())
 }
@@ -263,7 +263,7 @@ async fn test_server_required_secure_client_plain() -> Result<()> {
     } = all_datatype_testing_data();
     let schema = Arc::new(Schema::new(column_schemas.clone()));
     let recordbatch = RecordBatch::new(schema, columns).unwrap();
-    let table = MemTable::new("all_datatypes", recordbatch);
+    let table = MemTable::table("all_datatypes", recordbatch);
 
     let mysql_server = create_mysql_server(
         table,
@@ -300,7 +300,7 @@ async fn test_server_required_secure_client_plain_with_pkcs8_priv_key() -> Resul
     } = all_datatype_testing_data();
     let schema = Arc::new(Schema::new(column_schemas.clone()));
     let recordbatch = RecordBatch::new(schema, columns).unwrap();
-    let table = MemTable::new("all_datatypes", recordbatch);
+    let table = MemTable::table("all_datatypes", recordbatch);
 
     let mysql_server = create_mysql_server(
         table,
@@ -332,7 +332,7 @@ async fn test_db_name() -> Result<()> {
     } = all_datatype_testing_data();
     let schema = Arc::new(Schema::new(column_schemas.clone()));
     let recordbatch = RecordBatch::new(schema, columns).unwrap();
-    let table = MemTable::new("all_datatypes", recordbatch);
+    let table = MemTable::table("all_datatypes", recordbatch);
 
     let mysql_server = create_mysql_server(
         table,
@@ -347,7 +347,7 @@ async fn test_db_name() -> Result<()> {
 
     // None actually uses default database name
     let r = create_connection_default_db_name(server_addr.port(), client_tls).await;
-    assert!(r.is_ok());
+    let _ = r.unwrap();
 
     let r = create_connection(server_addr.port(), Some("tomcat"), client_tls).await;
     assert!(r.is_err());
@@ -364,7 +364,7 @@ async fn do_test_query_all_datatypes(server_tls: TlsOption, client_tls: bool) ->
     } = all_datatype_testing_data();
     let schema = Arc::new(Schema::new(column_schemas.clone()));
     let recordbatch = RecordBatch::new(schema, columns).unwrap();
-    let table = MemTable::new("all_datatypes", recordbatch);
+    let table = MemTable::table("all_datatypes", recordbatch);
 
     let mysql_server = create_mysql_server(
         table,
@@ -449,6 +449,93 @@ async fn test_query_concurrently() -> Result<()> {
     }
     assert_eq!(0, total_pending_queries);
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_query_prepared() -> Result<()> {
+    common_telemetry::init_default_ut_logging();
+    let TestingData {
+        column_schemas,
+        mysql_columns_def: _,
+        columns,
+        mysql_text_output_rows: _,
+    } = all_datatype_testing_data();
+    let schema = Arc::new(Schema::new(column_schemas.clone()));
+    let recordbatch = RecordBatch::new(schema, columns.clone()).unwrap();
+    let table = MemTable::table("all_datatypes", recordbatch);
+
+    let mysql_server = create_mysql_server(
+        table,
+        MysqlOpts {
+            ..Default::default()
+        },
+    )?;
+
+    let listening = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+    let server_addr = mysql_server.start(listening).await.unwrap();
+
+    let mut connection = create_connection_default_db_name(server_addr.port(), false)
+        .await
+        .unwrap();
+
+    test_prepare_all_type(column_schemas, columns, &mut connection).await;
+
+    Ok(())
+}
+
+async fn test_prepare_all_type(
+    column_schemas: Vec<ColumnSchema>,
+    columns: Vec<VectorRef>,
+    connection: &mut Conn,
+) {
+    let mut column_index = 0;
+    let mut stmt_id = 1;
+    for schema in column_schemas {
+        let query = format!(
+            "SELECT {} FROM all_datatypes WHERE {} = ?",
+            schema.name, schema.name
+        );
+        let statement = connection.prep(query).await;
+        let statement = statement.unwrap();
+        assert_eq!(stmt_id, statement.id());
+        stmt_id += 1;
+
+        let vector_ref = columns.get(column_index).unwrap();
+        for vector_index in 0..vector_ref.len() {
+            let v = vector_ref.get(vector_index);
+            let v = if let Some(v) = prepare_convert_type(v) {
+                v
+            } else {
+                continue;
+            };
+
+            let output: std::result::Result<Vec<Row>, mysql_async::Error> =
+                connection.exec(statement.clone(), vec![v]).await;
+
+            let rows = output.unwrap();
+            assert!(!rows.is_empty());
+        }
+        column_index += 1;
+    }
+}
+
+fn prepare_convert_type(item: Value) -> Option<mysql_async::Value> {
+    let v = match item {
+        Value::UInt8(u) => mysql_async::Value::UInt(u as u64),
+        Value::UInt16(u) => mysql_async::Value::UInt(u as u64),
+        Value::UInt32(u) => mysql_async::Value::UInt(u as u64),
+        Value::UInt64(u) => mysql_async::Value::UInt(u),
+        Value::Int8(i) => mysql_async::Value::Int(i as i64),
+        Value::Int16(i) => mysql_async::Value::Int(i as i64),
+        Value::Int32(i) => mysql_async::Value::Int(i as i64),
+        Value::Int64(i) => mysql_async::Value::Int(i),
+        Value::Float32(f) => mysql_async::Value::Float(f.into()),
+        Value::Float64(f) => mysql_async::Value::Double(f.into()),
+        Value::String(s) => mysql_async::Value::Bytes(s.as_utf8().as_bytes().to_vec()),
+        Value::Binary(b) => mysql_async::Value::Bytes(b.to_vec()),
+        _ => return None,
+    };
+    Some(v)
 }
 
 async fn create_connection_default_db_name(

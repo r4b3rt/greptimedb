@@ -17,7 +17,7 @@ mod stream;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use api::v1::{GreptimeRequest, RequestHeader};
+use api::v1::GreptimeRequest;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
@@ -26,34 +26,50 @@ use arrow_flight::{
 use async_trait::async_trait;
 use common_grpc::flight::{FlightEncoder, FlightMessage};
 use common_query::Output;
-use common_runtime::Runtime;
+use common_telemetry::tracing_context::TracingContext;
 use futures::Stream;
 use prost::Message;
-use session::context::{QueryContext, QueryContextRef};
-use snafu::{OptionExt, ResultExt};
-use tokio::sync::oneshot;
+use snafu::ResultExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::error;
-use crate::grpc::flight::stream::FlightRecordBatchStream;
-use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
+pub use crate::grpc::flight::stream::FlightRecordBatchStream;
+use crate::grpc::greptime_handler::GreptimeRequestHandler;
+use crate::grpc::TonicResult;
 
-type TonicResult<T> = Result<T, Status>;
-type TonicStream<T> = Pin<Box<dyn Stream<Item = TonicResult<T>> + Send + Sync + 'static>>;
+pub type TonicStream<T> = Pin<Box<dyn Stream<Item = TonicResult<T>> + Send + Sync + 'static>>;
 
-pub(crate) struct FlightHandler {
-    handler: ServerGrpcQueryHandlerRef,
-    runtime: Arc<Runtime>,
+/// A subset of [FlightService]
+#[async_trait]
+pub trait FlightCraft: Send + Sync + 'static {
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> TonicResult<Response<TonicStream<FlightData>>>;
 }
 
-impl FlightHandler {
-    pub(crate) fn new(handler: ServerGrpcQueryHandlerRef, runtime: Arc<Runtime>) -> Self {
-        Self { handler, runtime }
+pub type FlightCraftRef = Arc<dyn FlightCraft>;
+
+pub struct FlightCraftWrapper<T: FlightCraft>(pub T);
+
+impl<T: FlightCraft> From<T> for FlightCraftWrapper<T> {
+    fn from(t: T) -> Self {
+        Self(t)
     }
 }
 
 #[async_trait]
-impl FlightService for FlightHandler {
+impl FlightCraft for FlightCraftRef {
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> TonicResult<Response<TonicStream<FlightData>>> {
+        (**self).do_get(request).await
+    }
+}
+
+#[async_trait]
+impl<T: FlightCraft> FlightService for FlightCraftWrapper<T> {
     type HandshakeStream = TonicStream<HandshakeResponse>;
 
     async fn handshake(
@@ -89,35 +105,7 @@ impl FlightService for FlightHandler {
     type DoGetStream = TonicStream<FlightData>;
 
     async fn do_get(&self, request: Request<Ticket>) -> TonicResult<Response<Self::DoGetStream>> {
-        let ticket = request.into_inner().ticket;
-        let request =
-            GreptimeRequest::decode(ticket.as_slice()).context(error::InvalidFlightTicketSnafu)?;
-
-        let query = request.request.context(error::InvalidQuerySnafu {
-            reason: "Expecting non-empty GreptimeRequest.",
-        })?;
-        let query_ctx = create_query_context(request.header.as_ref());
-
-        let (tx, rx) = oneshot::channel();
-        let handler = self.handler.clone();
-
-        // Executes requests in another runtime to
-        // 1. prevent the execution from being cancelled unexpected by Tonic runtime;
-        // 2. avoid the handler blocks the gRPC runtime incidentally.
-        self.runtime.spawn(async move {
-            let result = handler.do_query(query, query_ctx).await;
-
-            // Ignore the sending result.
-            // Usually an error indicates the rx at Tonic side is dropped (due to request timeout).
-            let _ = tx.send(result);
-        });
-
-        // Safety: An early-dropped tx usually indicates a serious problem (like panic).
-        // This unwrap is used to poison the upper layer.
-        let output = rx.await.unwrap()?;
-
-        let stream = to_flight_data_stream(output);
-        Ok(Response::new(stream))
+        self.0.do_get(request).await
     }
 
     type DoPutStream = TonicStream<PutResult>;
@@ -154,14 +142,35 @@ impl FlightService for FlightHandler {
     }
 }
 
-fn to_flight_data_stream(output: Output) -> TonicStream<FlightData> {
+#[async_trait]
+impl FlightCraft for GreptimeRequestHandler {
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> TonicResult<Response<TonicStream<FlightData>>> {
+        let ticket = request.into_inner().ticket;
+        let request =
+            GreptimeRequest::decode(ticket.as_ref()).context(error::InvalidFlightTicketSnafu)?;
+
+        let output = self.handle_request(request).await?;
+
+        let stream: Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + Sync>> =
+            to_flight_data_stream(output, TracingContext::new());
+        Ok(Response::new(stream))
+    }
+}
+
+fn to_flight_data_stream(
+    output: Output,
+    tracing_context: TracingContext,
+) -> TonicStream<FlightData> {
     match output {
         Output::Stream(stream) => {
-            let stream = FlightRecordBatchStream::new(stream);
+            let stream = FlightRecordBatchStream::new(stream, tracing_context);
             Box::pin(stream) as _
         }
         Output::RecordBatches(x) => {
-            let stream = FlightRecordBatchStream::new(x.as_stream());
+            let stream = FlightRecordBatchStream::new(x.as_stream(), tracing_context);
             Box::pin(stream) as _
         }
         Output::AffectedRows(rows) => {
@@ -171,18 +180,4 @@ fn to_flight_data_stream(output: Output) -> TonicStream<FlightData> {
             Box::pin(stream) as _
         }
     }
-}
-
-fn create_query_context(header: Option<&RequestHeader>) -> QueryContextRef {
-    let ctx = QueryContext::arc();
-    if let Some(header) = header {
-        if !header.catalog.is_empty() {
-            ctx.set_current_catalog(&header.catalog);
-        }
-
-        if !header.schema.is_empty() {
-            ctx.set_current_schema(&header.schema);
-        }
-    };
-    ctx
 }

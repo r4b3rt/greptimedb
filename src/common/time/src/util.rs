@@ -12,9 +12,64 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::FromStr;
+
+use chrono::offset::Local;
+use chrono::{LocalResult, NaiveDateTime, TimeZone};
+use chrono_tz::Tz;
+
+pub fn format_utc_datetime(utc: &NaiveDateTime, pattern: &str) -> String {
+    if let Some(tz) = find_tz_from_env() {
+        format!("{}", tz.from_utc_datetime(utc).format(pattern))
+    } else {
+        format!("{}", Local.from_utc_datetime(utc).format(pattern))
+    }
+}
+
+pub fn local_datetime_to_utc(local: &NaiveDateTime) -> LocalResult<NaiveDateTime> {
+    if let Some(tz) = find_tz_from_env() {
+        tz.from_local_datetime(local).map(|x| x.naive_utc())
+    } else {
+        Local.from_local_datetime(local).map(|x| x.naive_utc())
+    }
+}
+
+pub fn find_tz_from_env() -> Option<Tz> {
+    // Windows does not support "TZ" env variable, which is used in the `Local` timezone under Unix.
+    // However, we are used to set "TZ" env as the default timezone without actually providing a
+    // timezone argument (especially in tests), and it's very convenient to do so, we decide to make
+    // it work under Windows as well.
+    std::env::var("TZ")
+        .ok()
+        .and_then(|tz| Tz::from_str(&tz).ok())
+}
+
 /// Returns the time duration since UNIX_EPOCH in milliseconds.
 pub fn current_time_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Returns the current time in rfc3339 format.
+pub fn current_time_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Returns the yesterday time in rfc3339 format.
+pub fn yesterday_rfc3339() -> String {
+    let now = chrono::Utc::now();
+    let day_before = now - chrono::Duration::days(1);
+    day_before.to_rfc3339()
+}
+
+/// Port of rust unstable features `int_roundings`.
+pub(crate) fn div_ceil(this: i64, rhs: i64) -> i64 {
+    let d = this / rhs;
+    let r = this % rhs;
+    if r > 0 && rhs > 0 {
+        d + 1
+    } else {
+        d
+    }
 }
 
 #[cfg(test)]
@@ -41,5 +96,11 @@ mod tests {
         assert_eq!(datetime_std.day(), datetime_now.day());
         assert_eq!(datetime_std.hour(), datetime_now.hour());
         assert_eq!(datetime_std.minute(), datetime_now.minute());
+    }
+
+    #[test]
+    fn test_div_ceil() {
+        let v0 = 9223372036854676001;
+        assert_eq!(9223372036854677, div_ceil(v0, 1000));
     }
 }

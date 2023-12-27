@@ -12,55 +12,95 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use common_query::logical_plan::{DfExpr, Expr};
 use common_telemetry::{error, warn};
 use common_time::range::TimestampRange;
+use common_time::timestamp::TimeUnit;
 use common_time::Timestamp;
-use datafusion::parquet::file::metadata::RowGroupMetaData;
-use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningStatistics};
+use datafusion_common::ToDFSchema;
+use datafusion_expr::expr::InList;
 use datafusion_expr::{Between, BinaryExpr, Operator};
-use datatypes::schema::SchemaRef;
+use datafusion_physical_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::{create_physical_expr, PhysicalExpr};
+use datatypes::arrow;
 use datatypes::value::scalar_value_to_timestamp;
+use snafu::ResultExt;
 
-use crate::predicate::stats::RowGroupPruningStatistics;
+use crate::error;
 
+#[cfg(test)]
 mod stats;
 
-#[derive(Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Predicate {
+    /// logical exprs
     exprs: Vec<Expr>,
 }
 
 impl Predicate {
+    /// Creates a new `Predicate` by converting logical exprs to physical exprs that can be
+    /// evaluated against record batches.
+    /// Returns error when failed to convert exprs.
     pub fn new(exprs: Vec<Expr>) -> Self {
         Self { exprs }
     }
 
-    pub fn empty() -> Self {
-        Self { exprs: vec![] }
+    /// Builds physical exprs according to provided schema.
+    pub fn to_physical_exprs(
+        &self,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> error::Result<Vec<Arc<dyn PhysicalExpr>>> {
+        let df_schema = schema
+            .clone()
+            .to_dfschema_ref()
+            .context(error::DatafusionSnafu)?;
+
+        // TODO(hl): `execution_props` provides variables required by evaluation.
+        // we may reuse the `execution_props` from `SessionState` once we support
+        // registering variables.
+        let execution_props = &ExecutionProps::new();
+
+        Ok(self
+            .exprs
+            .iter()
+            .filter_map(|expr| {
+                create_physical_expr(expr.df_expr(), df_schema.as_ref(), schema, execution_props)
+                    .ok()
+            })
+            .collect::<Vec<_>>())
     }
 
-    pub fn prune_row_groups(
+    /// Evaluates the predicate against the `stats`.
+    /// Returns a vector of boolean values, among which `false` means the row group can be skipped.
+    pub fn prune_with_stats<S: PruningStatistics>(
         &self,
-        schema: SchemaRef,
-        row_groups: &[RowGroupMetaData],
+        stats: &S,
+        schema: &arrow::datatypes::SchemaRef,
     ) -> Vec<bool> {
-        let mut res = vec![true; row_groups.len()];
-        for expr in &self.exprs {
-            match PruningPredicate::try_new(expr.df_expr().clone(), schema.arrow_schema().clone()) {
-                Ok(p) => {
-                    let stat = RowGroupPruningStatistics::new(row_groups, &schema);
-                    match p.prune(&stat) {
-                        Ok(r) => {
-                            for (curr_val, res) in r.into_iter().zip(res.iter_mut()) {
-                                *res &= curr_val
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to prune row groups, error: {:?}", e);
+        let mut res = vec![true; stats.num_containers()];
+        let physical_exprs = match self.to_physical_exprs(schema) {
+            Ok(expr) => expr,
+            Err(e) => {
+                warn!(e; "Failed to build physical expr from predicates: {:?}", &self.exprs);
+                return res;
+            }
+        };
+
+        for expr in &physical_exprs {
+            match PruningPredicate::try_new(expr.clone(), schema.clone()) {
+                Ok(p) => match p.prune(stats) {
+                    Ok(r) => {
+                        for (curr_val, res) in r.into_iter().zip(res.iter_mut()) {
+                            *res &= curr_val
                         }
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to prune row groups, error: {:?}", e);
+                    }
+                },
                 Err(e) => {
                     error!("Failed to create predicate for expr, error: {:?}", e);
                 }
@@ -72,15 +112,19 @@ impl Predicate {
 
 // tests for `TimeRangePredicateBuilder` locates in src/query/tests/time_range_filter_test.rs
 // since it requires query engine to convert sql to filters.
+/// `TimeRangePredicateBuilder` extracts time range from logical exprs to facilitate fast
+/// time range pruning.
 pub struct TimeRangePredicateBuilder<'a> {
     ts_col_name: &'a str,
+    ts_col_unit: TimeUnit,
     filters: &'a [Expr],
 }
 
 impl<'a> TimeRangePredicateBuilder<'a> {
-    pub fn new(ts_col_name: &'a str, filters: &'a [Expr]) -> Self {
+    pub fn new(ts_col_name: &'a str, ts_col_unit: TimeUnit, filters: &'a [Expr]) -> Self {
         Self {
             ts_col_name,
+            ts_col_unit,
             filters,
         }
     }
@@ -109,11 +153,11 @@ impl<'a> TimeRangePredicateBuilder<'a> {
                 low,
                 high,
             }) => self.extract_from_between_expr(expr, negated, low, high),
-            DfExpr::InList {
+            DfExpr::InList(InList {
                 expr,
                 list,
                 negated,
-            } => self.extract_from_in_list_expr(expr, *negated, list),
+            }) => self.extract_from_in_list_expr(expr, *negated, list),
             _ => None,
         }
     }
@@ -127,19 +171,62 @@ impl<'a> TimeRangePredicateBuilder<'a> {
         match op {
             Operator::Eq => self
                 .get_timestamp_filter(left, right)
+                .and_then(|(ts, _)| ts.convert_to(self.ts_col_unit))
                 .map(TimestampRange::single),
-            Operator::Lt => self
-                .get_timestamp_filter(left, right)
-                .map(|ts| TimestampRange::until_end(ts, false)),
-            Operator::LtEq => self
-                .get_timestamp_filter(left, right)
-                .map(|ts| TimestampRange::until_end(ts, true)),
-            Operator::Gt => self
-                .get_timestamp_filter(left, right)
-                .map(TimestampRange::from_start),
-            Operator::GtEq => self
-                .get_timestamp_filter(left, right)
-                .map(TimestampRange::from_start),
+            Operator::Lt => {
+                let (ts, reverse) = self.get_timestamp_filter(left, right)?;
+                if reverse {
+                    // [lit] < ts_col
+                    let ts_val = ts.convert_to(self.ts_col_unit)?.value();
+                    Some(TimestampRange::from_start(Timestamp::new(
+                        ts_val + 1,
+                        self.ts_col_unit,
+                    )))
+                } else {
+                    // ts_col < [lit]
+                    ts.convert_to_ceil(self.ts_col_unit)
+                        .map(|ts| TimestampRange::until_end(ts, false))
+                }
+            }
+            Operator::LtEq => {
+                let (ts, reverse) = self.get_timestamp_filter(left, right)?;
+                if reverse {
+                    // [lit] <= ts_col
+                    ts.convert_to_ceil(self.ts_col_unit)
+                        .map(TimestampRange::from_start)
+                } else {
+                    // ts_col <= [lit]
+                    ts.convert_to(self.ts_col_unit)
+                        .map(|ts| TimestampRange::until_end(ts, true))
+                }
+            }
+            Operator::Gt => {
+                let (ts, reverse) = self.get_timestamp_filter(left, right)?;
+                if reverse {
+                    // [lit] > ts_col
+                    ts.convert_to_ceil(self.ts_col_unit)
+                        .map(|t| TimestampRange::until_end(t, false))
+                } else {
+                    // ts_col > [lit]
+                    let ts_val = ts.convert_to(self.ts_col_unit)?.value();
+                    Some(TimestampRange::from_start(Timestamp::new(
+                        ts_val + 1,
+                        self.ts_col_unit,
+                    )))
+                }
+            }
+            Operator::GtEq => {
+                let (ts, reverse) = self.get_timestamp_filter(left, right)?;
+                if reverse {
+                    // [lit] >= ts_col
+                    ts.convert_to(self.ts_col_unit)
+                        .map(|t| TimestampRange::until_end(t, true))
+                } else {
+                    // ts_col >= [lit]
+                    ts.convert_to_ceil(self.ts_col_unit)
+                        .map(TimestampRange::from_start)
+                }
+            }
             Operator::And => {
                 // instead of return none when failed to extract time range from left/right, we unwrap the none into
                 // `TimestampRange::min_to_max`.
@@ -162,10 +249,6 @@ impl<'a> TimeRangePredicateBuilder<'a> {
             | Operator::Multiply
             | Operator::Divide
             | Operator::Modulo
-            | Operator::Like
-            | Operator::NotLike
-            | Operator::ILike
-            | Operator::NotILike
             | Operator::IsDistinctFrom
             | Operator::IsNotDistinctFrom
             | Operator::RegexMatch
@@ -177,14 +260,16 @@ impl<'a> TimeRangePredicateBuilder<'a> {
             | Operator::BitwiseXor
             | Operator::BitwiseShiftRight
             | Operator::BitwiseShiftLeft
-            | Operator::StringConcat => None,
+            | Operator::StringConcat
+            | Operator::ArrowAt
+            | Operator::AtArrow => None,
         }
     }
 
-    fn get_timestamp_filter(&self, left: &DfExpr, right: &DfExpr) -> Option<Timestamp> {
-        let (col, lit) = match (left, right) {
-            (DfExpr::Column(column), DfExpr::Literal(scalar)) => (column, scalar),
-            (DfExpr::Literal(scalar), DfExpr::Column(column)) => (column, scalar),
+    fn get_timestamp_filter(&self, left: &DfExpr, right: &DfExpr) -> Option<(Timestamp, bool)> {
+        let (col, lit, reverse) = match (left, right) {
+            (DfExpr::Column(column), DfExpr::Literal(scalar)) => (column, scalar, false),
+            (DfExpr::Literal(scalar), DfExpr::Column(column)) => (column, scalar, true),
             _ => {
                 return None;
             }
@@ -192,7 +277,7 @@ impl<'a> TimeRangePredicateBuilder<'a> {
         if col.name != self.ts_col_name {
             return None;
         }
-        scalar_value_to_timestamp(lit)
+        scalar_value_to_timestamp(lit).map(|t| (t, reverse))
     }
 
     fn extract_from_between_expr(
@@ -202,7 +287,9 @@ impl<'a> TimeRangePredicateBuilder<'a> {
         low: &DfExpr,
         high: &DfExpr,
     ) -> Option<TimestampRange> {
-        let DfExpr::Column(col) = expr else { return None; };
+        let DfExpr::Column(col) = expr else {
+            return None;
+        };
         if col.name != self.ts_col_name {
             return None;
         }
@@ -213,8 +300,10 @@ impl<'a> TimeRangePredicateBuilder<'a> {
 
         match (low, high) {
             (DfExpr::Literal(low), DfExpr::Literal(high)) => {
-                let low_opt = scalar_value_to_timestamp(low);
-                let high_opt = scalar_value_to_timestamp(high);
+                let low_opt =
+                    scalar_value_to_timestamp(low).and_then(|ts| ts.convert_to(self.ts_col_unit));
+                let high_opt = scalar_value_to_timestamp(high)
+                    .and_then(|ts| ts.convert_to_ceil(self.ts_col_unit));
                 Some(TimestampRange::new_inclusive(low_opt, high_opt))
             }
             _ => None,
@@ -231,7 +320,9 @@ impl<'a> TimeRangePredicateBuilder<'a> {
         if negated {
             return None;
         }
-        let DfExpr::Column(col) = expr else { return None; };
+        let DfExpr::Column(col) = expr else {
+            return None;
+        };
         if col.name != self.ts_col_name {
             return None;
         }
@@ -259,19 +350,183 @@ impl<'a> TimeRangePredicateBuilder<'a> {
 mod tests {
     use std::sync::Arc;
 
+    use common_test_util::temp_dir::{create_temp_dir, TempDir};
     use datafusion::parquet::arrow::ArrowWriter;
-    pub use datafusion::parquet::schema::types::BasicTypeInfo;
     use datafusion_common::{Column, ScalarValue};
-    use datafusion_expr::{BinaryExpr, Expr, Literal, Operator};
+    use datafusion_expr::{col, lit, BinaryExpr, Literal, Operator};
     use datatypes::arrow::array::Int32Array;
     use datatypes::arrow::datatypes::{DataType, Field, Schema};
     use datatypes::arrow::record_batch::RecordBatch;
     use datatypes::arrow_array::StringArray;
     use parquet::arrow::ParquetRecordBatchStreamBuilder;
     use parquet::file::properties::WriterProperties;
-    use tempdir::TempDir;
 
     use super::*;
+    use crate::predicate::stats::RowGroupPruningStatistics;
+
+    fn check_build_predicate(expr: DfExpr, expect: TimestampRange) {
+        assert_eq!(
+            expect,
+            TimeRangePredicateBuilder::new("ts", TimeUnit::Millisecond, &[Expr::from(expr)])
+                .build()
+        );
+    }
+
+    #[test]
+    fn test_gt() {
+        // ts > 1ms
+        check_build_predicate(
+            col("ts").gt(lit(ScalarValue::TimestampMillisecond(Some(1), None))),
+            TimestampRange::from_start(Timestamp::new_millisecond(2)),
+        );
+
+        // 1ms > ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMillisecond(Some(1), None)).gt(col("ts")),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), false),
+        );
+
+        // 1001us > ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMicrosecond(Some(1001), None)).gt(col("ts")),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), true),
+        );
+
+        // ts > 1001us
+        check_build_predicate(
+            col("ts").gt(lit(ScalarValue::TimestampMicrosecond(Some(1001), None))),
+            TimestampRange::from_start(Timestamp::new_millisecond(2)),
+        );
+
+        // 1s > ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampSecond(Some(1), None)).gt(col("ts")),
+            TimestampRange::until_end(Timestamp::new_millisecond(1000), false),
+        );
+
+        // ts > 1s
+        check_build_predicate(
+            col("ts").gt(lit(ScalarValue::TimestampSecond(Some(1), None))),
+            TimestampRange::from_start(Timestamp::new_millisecond(1001)),
+        );
+    }
+
+    #[test]
+    fn test_gt_eq() {
+        // ts >= 1ms
+        check_build_predicate(
+            col("ts").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(1), None))),
+            TimestampRange::from_start(Timestamp::new_millisecond(1)),
+        );
+
+        // 1ms >= ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMillisecond(Some(1), None)).gt_eq(col("ts")),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), true),
+        );
+
+        // 1001us >= ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMicrosecond(Some(1001), None)).gt_eq(col("ts")),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), true),
+        );
+
+        // ts >= 1001us
+        check_build_predicate(
+            col("ts").gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(1001), None))),
+            TimestampRange::from_start(Timestamp::new_millisecond(2)),
+        );
+
+        // 1s >= ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampSecond(Some(1), None)).gt_eq(col("ts")),
+            TimestampRange::until_end(Timestamp::new_millisecond(1000), true),
+        );
+
+        // ts >= 1s
+        check_build_predicate(
+            col("ts").gt_eq(lit(ScalarValue::TimestampSecond(Some(1), None))),
+            TimestampRange::from_start(Timestamp::new_millisecond(1000)),
+        );
+    }
+
+    #[test]
+    fn test_lt() {
+        // ts < 1ms
+        check_build_predicate(
+            col("ts").lt(lit(ScalarValue::TimestampMillisecond(Some(1), None))),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), false),
+        );
+
+        // 1ms < ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMillisecond(Some(1), None)).lt(col("ts")),
+            TimestampRange::from_start(Timestamp::new_millisecond(2)),
+        );
+
+        // 1001us < ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMicrosecond(Some(1001), None)).lt(col("ts")),
+            TimestampRange::from_start(Timestamp::new_millisecond(2)),
+        );
+
+        // ts < 1001us
+        check_build_predicate(
+            col("ts").lt(lit(ScalarValue::TimestampMicrosecond(Some(1001), None))),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), true),
+        );
+
+        // 1s < ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampSecond(Some(1), None)).lt(col("ts")),
+            TimestampRange::from_start(Timestamp::new_millisecond(1001)),
+        );
+
+        // ts < 1s
+        check_build_predicate(
+            col("ts").lt(lit(ScalarValue::TimestampSecond(Some(1), None))),
+            TimestampRange::until_end(Timestamp::new_millisecond(1000), false),
+        );
+    }
+
+    #[test]
+    fn test_lt_eq() {
+        // ts <= 1ms
+        check_build_predicate(
+            col("ts").lt_eq(lit(ScalarValue::TimestampMillisecond(Some(1), None))),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), true),
+        );
+
+        // 1ms <= ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMillisecond(Some(1), None)).lt_eq(col("ts")),
+            TimestampRange::from_start(Timestamp::new_millisecond(1)),
+        );
+
+        // 1001us <= ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampMicrosecond(Some(1001), None)).lt_eq(col("ts")),
+            TimestampRange::from_start(Timestamp::new_millisecond(2)),
+        );
+
+        // ts <= 1001us
+        check_build_predicate(
+            col("ts").lt_eq(lit(ScalarValue::TimestampMicrosecond(Some(1001), None))),
+            TimestampRange::until_end(Timestamp::new_millisecond(1), true),
+        );
+
+        // 1s <= ts
+        check_build_predicate(
+            lit(ScalarValue::TimestampSecond(Some(1), None)).lt_eq(col("ts")),
+            TimestampRange::from_start(Timestamp::new_millisecond(1000)),
+        );
+
+        // ts <= 1s
+        check_build_predicate(
+            col("ts").lt_eq(lit(ScalarValue::TimestampSecond(Some(1), None))),
+            TimestampRange::until_end(Timestamp::new_millisecond(1000), true),
+        );
+    }
 
     async fn gen_test_parquet_file(dir: &TempDir, cnt: usize) -> (String, Arc<Schema>) {
         let path = dir
@@ -307,14 +562,19 @@ mod tests {
             let rb = RecordBatch::try_new(schema.clone(), vec![name_array, count_array]).unwrap();
             writer.write(&rb).unwrap();
         }
-        writer.close().unwrap();
+        let _ = writer.close().unwrap();
         (path, schema)
     }
 
-    async fn assert_prune(array_cnt: usize, predicate: Predicate, expect: Vec<bool>) {
-        let dir = TempDir::new("prune_parquet").unwrap();
-        let (path, schema) = gen_test_parquet_file(&dir, array_cnt).await;
-        let schema = Arc::new(datatypes::schema::Schema::try_from(schema).unwrap());
+    async fn assert_prune(
+        array_cnt: usize,
+        filters: Vec<common_query::logical_plan::Expr>,
+        expect: Vec<bool>,
+    ) {
+        let dir = create_temp_dir("prune_parquet");
+        let (path, arrow_schema) = gen_test_parquet_file(&dir, array_cnt).await;
+        let schema = Arc::new(datatypes::schema::Schema::try_from(arrow_schema.clone()).unwrap());
+        let arrow_predicate = Predicate::new(filters);
         let builder = ParquetRecordBatchStreamBuilder::new(
             tokio::fs::OpenOptions::new()
                 .read(true)
@@ -326,23 +586,27 @@ mod tests {
         .unwrap();
         let metadata = builder.metadata().clone();
         let row_groups = metadata.row_groups();
-        let res = predicate.prune_row_groups(schema, row_groups);
+
+        let stats = RowGroupPruningStatistics::new(row_groups, &schema);
+        let res = arrow_predicate.prune_with_stats(&stats, &arrow_schema);
         assert_eq!(expect, res);
     }
 
-    fn gen_predicate(max_val: i32, op: Operator) -> Predicate {
-        Predicate::new(vec![common_query::logical_plan::Expr::from(
-            Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(Expr::Column(Column::from_name("cnt"))),
+    fn gen_predicate(max_val: i32, op: Operator) -> Vec<common_query::logical_plan::Expr> {
+        vec![common_query::logical_plan::Expr::from(
+            datafusion_expr::Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(datafusion_expr::Expr::Column(Column::from_name("cnt"))),
                 op,
-                right: Box::new(Expr::Literal(ScalarValue::Int32(Some(max_val)))),
+                right: Box::new(datafusion_expr::Expr::Literal(ScalarValue::Int32(Some(
+                    max_val,
+                )))),
             }),
-        )])
+        )]
     }
 
     #[tokio::test]
     async fn test_prune_empty() {
-        assert_prune(3, Predicate::empty(), vec![true]).await;
+        assert_prune(3, vec![], vec![true]).await;
     }
 
     #[tokio::test]
@@ -403,10 +667,26 @@ mod tests {
     #[tokio::test]
     async fn test_or() {
         // cnt > 30 or cnt < 20
-        let e = Expr::Column(Column::from_name("cnt"))
+        let e = datafusion_expr::Expr::Column(Column::from_name("cnt"))
             .gt(30.lit())
-            .or(Expr::Column(Column::from_name("cnt")).lt(20.lit()));
-        let p = Predicate::new(vec![e.into()]);
-        assert_prune(40, p, vec![true, true, false, true]).await;
+            .or(datafusion_expr::Expr::Column(Column::from_name("cnt")).lt(20.lit()));
+        assert_prune(40, vec![e.into()], vec![true, true, false, true]).await;
+    }
+
+    #[tokio::test]
+    async fn test_to_physical_expr() {
+        let predicate = Predicate::new(vec![
+            Expr::from(col("host").eq(lit("host_a"))),
+            Expr::from(col("ts").gt(lit(ScalarValue::TimestampMicrosecond(Some(123), None)))),
+        ]);
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "host",
+            arrow::datatypes::DataType::Utf8,
+            false,
+        )]));
+
+        let predicates = predicate.to_physical_exprs(&schema).unwrap();
+        assert!(!predicates.is_empty());
     }
 }

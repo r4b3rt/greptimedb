@@ -30,6 +30,8 @@ pub enum LogicalTypeId {
     Float32,
     Float64,
 
+    Decimal128,
+
     // String types:
     String,
     Binary,
@@ -46,8 +48,26 @@ pub enum LogicalTypeId {
     TimestampMillisecond,
     TimestampMicrosecond,
     TimestampNanosecond,
+    /// A 64-bit time representing the elapsed time since midnight in the unit of `TimeUnit`.
+    TimeSecond,
+    TimeMillisecond,
+    TimeMicrosecond,
+    TimeNanosecond,
+    /// A 64-bit duration representing the elapsed time in either seconds,
+    /// milliseconds, microseconds or nanoseconds.
+    DurationSecond,
+    DurationMillisecond,
+    DurationMicrosecond,
+    DurationNanosecond,
+    /// A 32-bit interval representing the elapsed time in months.
+    IntervalYearMonth,
+    /// A 64-bit interval representing the elapsed time in days and milliseconds.
+    IntervalDayTime,
+    /// A 128-bit interval representing the elapsed time in months, days and nanoseconds.
+    IntervalMonthDayNano,
 
     List,
+    Dictionary,
 }
 
 impl LogicalTypeId {
@@ -88,6 +108,24 @@ impl LogicalTypeId {
             LogicalTypeId::List => {
                 ConcreteDataType::list_datatype(ConcreteDataType::null_datatype())
             }
+            LogicalTypeId::Dictionary => ConcreteDataType::dictionary_datatype(
+                ConcreteDataType::null_datatype(),
+                ConcreteDataType::null_datatype(),
+            ),
+            LogicalTypeId::TimeSecond => ConcreteDataType::time_second_datatype(),
+            LogicalTypeId::TimeMillisecond => ConcreteDataType::time_millisecond_datatype(),
+            LogicalTypeId::TimeMicrosecond => ConcreteDataType::time_microsecond_datatype(),
+            LogicalTypeId::TimeNanosecond => ConcreteDataType::time_nanosecond_datatype(),
+            LogicalTypeId::IntervalYearMonth => ConcreteDataType::interval_year_month_datatype(),
+            LogicalTypeId::IntervalDayTime => ConcreteDataType::interval_day_time_datatype(),
+            LogicalTypeId::IntervalMonthDayNano => {
+                ConcreteDataType::interval_month_day_nano_datatype()
+            }
+            LogicalTypeId::DurationSecond => ConcreteDataType::duration_second_datatype(),
+            LogicalTypeId::DurationMillisecond => ConcreteDataType::duration_millisecond_datatype(),
+            LogicalTypeId::DurationMicrosecond => ConcreteDataType::duration_microsecond_datatype(),
+            LogicalTypeId::DurationNanosecond => ConcreteDataType::duration_nanosecond_datatype(),
+            LogicalTypeId::Decimal128 => ConcreteDataType::decimal128_default_datatype(),
         }
     }
 }

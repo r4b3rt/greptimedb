@@ -14,16 +14,18 @@
 
 //! Common traits and structures for the procedure framework.
 
+#![feature(assert_matches)]
+
 pub mod error;
-#[allow(dead_code)]
-mod local;
+pub mod local;
+pub mod options;
 mod procedure;
-// TODO(yingwen): Remove this attribute once ProcedureManager is implemented.
-#[allow(dead_code)]
-mod store;
+pub mod store;
+pub mod watcher;
 
 pub use crate::error::{Error, Result};
 pub use crate::procedure::{
-    BoxedProcedure, Context, LockKey, Procedure, ProcedureId, ProcedureManager,
+    BoxedProcedure, Context, ContextProvider, LockKey, Procedure, ProcedureId, ProcedureManager,
     ProcedureManagerRef, ProcedureState, ProcedureWithId, Status,
 };
+pub use crate::watcher::Watcher;

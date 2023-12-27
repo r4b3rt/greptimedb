@@ -5,19 +5,28 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-recursion = "1.0"
 async-trait.workspace = true
-bytemuck = "1.12"
-catalog = { path = "../catalog" }
-common-error = { path = "../common/error" }
-common-catalog = { path = "../common/catalog" }
+bytemuck.workspace = true
+catalog.workspace = true
+common-catalog.workspace = true
+common-error.workspace = true
+common-macro.workspace = true
+common-recordbatch.workspace = true
+common-telemetry.workspace = true
 datafusion.workspace = true
-datatypes = { path = "../datatypes" }
+datatypes.workspace = true
 futures = "0.3"
-promql-parser = { git = "https://github.com/GreptimeTeam/promql-parser.git", rev = "d027ce428a6a2df5a652b8558608c77d33c31644" }
-session = { path = "../session" }
-snafu = { version = "0.7", features = ["backtraces"] }
-table = { path = "../table" }
+greptime-proto.workspace = true
+lazy_static.workspace = true
+prometheus.workspace = true
+promql-parser = "0.1.1"
+prost.workspace = true
+session.workspace = true
+snafu.workspace = true
+table.workspace = true
 
 [dev-dependencies]
+query.workspace = true
+session = { workspace = true, features = ["testing"] }
 tokio.workspace = true
-query = { path = "../query" }

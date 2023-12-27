@@ -14,137 +14,131 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use common_macro::stack_trace_debug;
 use common_query::prelude::Expr;
 use datafusion_common::ScalarValue;
-use snafu::Snafu;
-use store_api::storage::RegionId;
+use snafu::{Location, Snafu};
+use store_api::storage::{RegionId, RegionNumber};
+use table::metadata::TableId;
 
-#[derive(Debug, Snafu)]
+#[derive(Snafu)]
 #[snafu(visibility(pub))]
+#[stack_trace_debug]
 pub enum Error {
-    #[snafu(display("Failed to get cache, error: {}", err_msg))]
-    GetCache {
-        err_msg: String,
-        backtrace: Backtrace,
+    #[snafu(display("Table route manager error"))]
+    TableRouteManager {
+        source: common_meta::error::Error,
+        location: Location,
     },
 
-    #[snafu(display("Failed to request Meta, source: {}", source))]
-    RequestMeta {
-        #[snafu(backtrace)]
-        source: meta_client::error::Error,
-    },
+    #[snafu(display("Failed to get meta info from cache, error: {}", err_msg))]
+    GetCache { err_msg: String, location: Location },
 
-    #[snafu(display("Failed to find Datanode, table: {} region: {:?}", table, region))]
+    #[snafu(display("Failed to find Datanode, table id: {}, region: {}", table_id, region))]
     FindDatanode {
-        table: String,
-        region: RegionId,
-        backtrace: Backtrace,
+        table_id: TableId,
+        region: RegionNumber,
+        location: Location,
     },
 
-    #[snafu(display("Failed to find table routes for table {}", table_name))]
+    #[snafu(display("Failed to find table routes for table id {}", table_id))]
     FindTableRoutes {
-        table_name: String,
-        backtrace: Backtrace,
+        table_id: TableId,
+        location: Location,
     },
 
     #[snafu(display(
         "Failed to find region routes for table {}, region id: {}",
-        table_name,
+        table_id,
         region_id
     ))]
     FindRegionRoutes {
-        table_name: String,
+        table_id: TableId,
         region_id: u64,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display("Failed to serialize value to json, source: {}", source))]
+    #[snafu(display("Failed to serialize value to json"))]
     SerializeJson {
-        source: serde_json::Error,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: serde_json::Error,
+        location: Location,
     },
 
-    #[snafu(display("Failed to deserialize value from json, source: {}", source))]
+    #[snafu(display("Failed to deserialize value from json"))]
     DeserializeJson {
-        source: serde_json::Error,
-        backtrace: Backtrace,
+        #[snafu(source)]
+        error: serde_json::Error,
+        location: Location,
     },
+
+    #[snafu(display("The column '{}' does not have a default value.", column))]
+    MissingDefaultValue { column: String },
 
     #[snafu(display("Expect {} region keys, actual {}", expect, actual))]
     RegionKeysSize {
         expect: usize,
         actual: usize,
-        backtrace: Backtrace,
+        location: Location,
     },
 
     #[snafu(display("Failed to find region, reason: {}", reason))]
-    FindRegion {
-        reason: String,
-        backtrace: Backtrace,
-    },
+    FindRegion { reason: String, location: Location },
 
     #[snafu(display("Failed to find regions by filters: {:?}", filters))]
     FindRegions {
         filters: Vec<Expr>,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Failed to find partition column: {}", column_name))]
-    FindPartitionColumn {
-        column_name: String,
-        backtrace: Backtrace,
+        location: Location,
     },
 
     #[snafu(display("Invalid InsertRequest, reason: {}", reason))]
-    InvalidInsertRequest {
-        reason: String,
-        backtrace: Backtrace,
-    },
+    InvalidInsertRequest { reason: String, location: Location },
 
-    #[snafu(display(
-        "Invalid table route data in meta, table name: {}, msg: {}",
-        table_name,
-        err_msg
-    ))]
+    #[snafu(display("Invalid DeleteRequest, reason: {}", reason))]
+    InvalidDeleteRequest { reason: String, location: Location },
+
+    #[snafu(display("Invalid table route data, table id: {}, msg: {}", table_id, err_msg))]
     InvalidTableRouteData {
-        table_name: String,
+        table_id: TableId,
         err_msg: String,
-        backtrace: Backtrace,
+        location: Location,
     },
 
-    #[snafu(display(
-        "Failed to convert DataFusion's ScalarValue: {:?}, source: {}",
-        value,
-        source
-    ))]
+    #[snafu(display("Failed to convert DataFusion's ScalarValue: {:?}", value))]
     ConvertScalarValue {
         value: ScalarValue,
-        #[snafu(backtrace)]
+        location: Location,
         source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Failed to find leader of table id {} region {}", table_id, region_id))]
+    FindLeader {
+        table_id: TableId,
+        region_id: RegionId,
+        location: Location,
     },
 }
 
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::GetCache { .. } => StatusCode::StorageUnavailable,
+            Error::GetCache { .. } | Error::FindLeader { .. } => StatusCode::StorageUnavailable,
             Error::FindRegionRoutes { .. } => StatusCode::InvalidArguments,
             Error::FindTableRoutes { .. } => StatusCode::InvalidArguments,
-            Error::RequestMeta { source, .. } => source.status_code(),
             Error::FindRegion { .. }
             | Error::FindRegions { .. }
             | Error::RegionKeysSize { .. }
             | Error::InvalidInsertRequest { .. }
-            | Error::FindPartitionColumn { .. } => StatusCode::InvalidArguments,
+            | Error::InvalidDeleteRequest { .. } => StatusCode::InvalidArguments,
             Error::SerializeJson { .. } | Error::DeserializeJson { .. } => StatusCode::Internal,
             Error::InvalidTableRouteData { .. } => StatusCode::Internal,
             Error::ConvertScalarValue { .. } => StatusCode::Internal,
             Error::FindDatanode { .. } => StatusCode::InvalidArguments,
+            Error::TableRouteManager { source, .. } => source.status_code(),
+            Error::MissingDefaultValue { .. } => StatusCode::Internal,
         }
-    }
-    fn backtrace_opt(&self) -> Option<&Backtrace> {
-        ErrorCompat::backtrace(self)
     }
 
     fn as_any(&self) -> &dyn Any {

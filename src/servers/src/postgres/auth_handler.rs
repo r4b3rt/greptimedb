@@ -13,8 +13,12 @@
 // limitations under the License.
 
 use std::fmt::Debug;
+use std::sync::Exclusive;
 
+use ::auth::{userinfo_by_name, Identity, Password, UserInfoRef, UserProviderRef};
 use async_trait::async_trait;
+use common_catalog::parse_catalog_and_schema_from_db_string;
+use common_error::ext::ErrorExt;
 use futures::{Sink, SinkExt};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::{auth, ClientInfo, PgWireConnectionState};
@@ -22,13 +26,12 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::response::ErrorResponse;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use session::context::{QueryContextRef, UserInfo};
-use snafu::ResultExt;
+use session::Session;
+use snafu::IntoError;
 
 use super::PostgresServerHandler;
-use crate::auth::{Identity, Password, UserProviderRef};
-use crate::error;
-use crate::error::Result;
+use crate::error::{AuthSnafu, Result};
+use crate::metrics::METRIC_AUTH_FAILURE;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 
 pub(crate) struct PgLoginVerifier {
@@ -70,59 +73,56 @@ impl LoginInfo {
 }
 
 impl PgLoginVerifier {
-    async fn verify_pwd(&self, password: &str, login: &LoginInfo) -> Result<bool> {
-        if let Some(user_provider) = &self.user_provider {
-            let user_name = match &login.user {
-                Some(name) => name,
-                None => return Ok(false),
-            };
+    async fn auth(&self, login: &LoginInfo, password: &str) -> Result<Option<UserInfoRef>> {
+        let user_provider = match &self.user_provider {
+            Some(provider) => provider,
+            None => return Ok(None),
+        };
 
-            // TODO(fys): pass user_info to context
-            let _user_info = user_provider
-                .authenticate(
-                    Identity::UserId(user_name, None),
-                    Password::PlainText(password),
-                )
-                .await
-                .context(error::AuthSnafu)?;
-        }
-        Ok(true)
-    }
+        let user_name = match &login.user {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+        let catalog = match &login.catalog {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+        let schema = match &login.schema {
+            Some(name) => name,
+            None => return Ok(None),
+        };
 
-    async fn authorize(&self, login: &LoginInfo) -> Result<bool> {
-        // at this time, username in login info should be valid
-        // TODO(shuiyisong): change to use actually user_info from session
-        if let Some(user_provider) = &self.user_provider {
-            let user_name = match &login.user {
-                Some(name) => name,
-                None => return Ok(false),
-            };
-            let catalog = match &login.catalog {
-                Some(name) => name,
-                None => return Ok(false),
-            };
-            let schema = match &login.schema {
-                Some(name) => name,
-                None => return Ok(false),
-            };
-            user_provider
-                .authorize(catalog, schema, &UserInfo::new(user_name))
-                .await?;
+        match user_provider
+            .auth(
+                Identity::UserId(user_name, None),
+                Password::PlainText(password.to_string().into()),
+                catalog,
+                schema,
+            )
+            .await
+        {
+            Err(e) => {
+                METRIC_AUTH_FAILURE
+                    .with_label_values(&[e.status_code().as_ref()])
+                    .inc();
+                Err(AuthSnafu.into_error(e))
+            }
+            Ok(user_info) => Ok(Some(user_info)),
         }
-        Ok(true)
     }
 }
 
-fn set_query_context_from_client_info<C>(client: &C, query_context: QueryContextRef)
+fn set_client_info<C>(client: &C, session: &Session)
 where
     C: ClientInfo,
 {
     if let Some(current_catalog) = client.metadata().get(super::METADATA_CATALOG) {
-        query_context.set_current_catalog(current_catalog);
+        session.set_catalog(current_catalog.clone());
     }
     if let Some(current_schema) = client.metadata().get(super::METADATA_SCHEMA) {
-        query_context.set_current_schema(current_schema);
+        session.set_schema(current_schema.clone());
     }
+    // set userinfo outside
 }
 
 #[async_trait]
@@ -148,14 +148,11 @@ impl StartupHandler for PostgresServerHandler {
                 auth::save_startup_parameters_to_metadata(client, startup);
 
                 // check if db is valid
-                match resolve_db_info(client, self.query_handler.clone())? {
+                match resolve_db_info(Exclusive::new(client), self.query_handler.clone()).await? {
                     DbResolution::Resolved(catalog, schema) => {
-                        client
-                            .metadata_mut()
-                            .insert(super::METADATA_CATALOG.to_owned(), catalog);
-                        client
-                            .metadata_mut()
-                            .insert(super::METADATA_SCHEMA.to_owned(), schema);
+                        let metadata = client.metadata_mut();
+                        let _ = metadata.insert(super::METADATA_CATALOG.to_owned(), catalog);
+                        let _ = metadata.insert(super::METADATA_SCHEMA.to_owned(), schema);
                     }
                     DbResolution::NotFound(msg) => {
                         send_error(client, "FATAL", "3D000", msg).await?;
@@ -171,7 +168,10 @@ impl StartupHandler for PostgresServerHandler {
                         ))
                         .await?;
                 } else {
-                    set_query_context_from_client_info(client, self.query_ctx.clone());
+                    self.session.set_user_info(userinfo_by_name(
+                        client.metadata().get(super::METADATA_USER).cloned(),
+                    ));
+                    set_client_info(client, &self.session);
                     auth::finish_authentication(client, self.param_provider.as_ref()).await;
                 }
             }
@@ -182,12 +182,15 @@ impl StartupHandler for PostgresServerHandler {
                 let pwd = pwd.into_password()?;
 
                 let login_info = LoginInfo::from_client_info(client);
+
                 // do authenticate
-                let authenticate_result = self
-                    .login_verifier
-                    .verify_pwd(pwd.password(), &login_info)
-                    .await;
-                if !matches!(authenticate_result, Ok(true)) {
+                let auth_result = self.login_verifier.auth(&login_info, pwd.password()).await;
+
+                if let Ok(Some(user_info)) = auth_result {
+                    self.session.set_user_info(user_info);
+                    set_client_info(client, &self.session);
+                    auth::finish_authentication(client, self.param_provider.as_ref()).await;
+                } else {
                     return send_error(
                         client,
                         "FATAL",
@@ -196,19 +199,6 @@ impl StartupHandler for PostgresServerHandler {
                     )
                     .await;
                 }
-                // do authorize
-                let authorize_result = self.login_verifier.authorize(&login_info).await;
-                if !matches!(authorize_result, Ok(true)) {
-                    return send_error(
-                        client,
-                        "FATAL",
-                        "28P01",
-                        "password authorization failed".to_owned(),
-                    )
-                    .await;
-                }
-                set_query_context_from_client_info(client, self.query_ctx.clone());
-                auth::finish_authentication(client, self.param_provider.as_ref()).await;
             }
             _ => {}
         }
@@ -236,18 +226,19 @@ enum DbResolution {
 }
 
 /// A function extracted to resolve lifetime and readability issues:
-fn resolve_db_info<C>(
-    client: &mut C,
+async fn resolve_db_info<C>(
+    client: Exclusive<&mut C>,
     query_handler: ServerSqlQueryHandlerRef,
 ) -> PgWireResult<DbResolution>
 where
     C: ClientInfo + Unpin + Send,
 {
-    let db_ref = client.metadata().get(super::METADATA_DATABASE);
+    let db_ref = client.into_inner().metadata().get(super::METADATA_DATABASE);
     if let Some(db) = db_ref {
-        let (catalog, schema) = crate::parse_catalog_and_schema_from_client_database_name(db);
+        let (catalog, schema) = parse_catalog_and_schema_from_db_string(db);
         if query_handler
             .is_valid_schema(catalog, schema)
+            .await
             .map_err(|e| PgWireError::ApiError(Box::new(e)))?
         {
             Ok(DbResolution::Resolved(

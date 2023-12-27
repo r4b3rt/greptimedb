@@ -16,17 +16,16 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ::auth::UserProviderRef;
 use async_trait::async_trait;
 use common_runtime::Runtime;
 use common_telemetry::logging::error;
 use common_telemetry::{debug, warn};
 use futures::StreamExt;
 use pgwire::tokio::process_socket;
-use tokio;
 use tokio_rustls::TlsAcceptor;
 
 use super::{MakePostgresServerHandler, MakePostgresServerHandlerBuilder};
-use crate::auth::UserProviderRef;
 use crate::error::Result;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::server::{AbortableStream, BaseTcpServer, Server};
@@ -67,34 +66,49 @@ impl PostgresServer {
         accepting_stream: AbortableStream,
         tls_acceptor: Option<Arc<TlsAcceptor>>,
     ) -> impl Future<Output = ()> {
-        let handler = self.make_handler.clone();
+        let handler_maker = self.make_handler.clone();
         accepting_stream.for_each(move |tcp_stream| {
             let io_runtime = io_runtime.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let handler = handler.clone();
+            let handler_maker = handler_maker.clone();
 
             async move {
                 match tcp_stream {
                     Err(error) => error!("Broken pipe: {}", error), // IoError doesn't impl ErrorExt.
                     Ok(io_stream) => {
-                        match io_stream.peer_addr() {
-                            Ok(addr) => debug!("PostgreSQL client coming from {}", addr),
-                            Err(e) => warn!("Failed to get PostgreSQL client addr, err: {}", e),
-                        }
+                        let addr = match io_stream.peer_addr() {
+                            Ok(addr) => {
+                                debug!("PostgreSQL client coming from {}", addr);
+                                Some(addr)
+                            }
+                            Err(e) => {
+                                warn!("Failed to get PostgreSQL client addr, err: {}", e);
+                                None
+                            }
+                        };
 
-                        io_runtime.spawn(process_socket(
-                            io_stream,
-                            tls_acceptor.clone(),
-                            handler.clone(),
-                            handler.clone(),
-                            handler,
-                        ));
+                        let _handle = io_runtime.spawn(async move {
+                            crate::metrics::METRIC_POSTGRES_CONNECTIONS.inc();
+                            let pg_handler = Arc::new(handler_maker.make(addr));
+                            let r = process_socket(
+                                io_stream,
+                                tls_acceptor.clone(),
+                                pg_handler.clone(),
+                                pg_handler.clone(),
+                                pg_handler,
+                            )
+                            .await;
+                            crate::metrics::METRIC_POSTGRES_CONNECTIONS.dec();
+                            r
+                        });
                     }
                 };
             }
         })
     }
 }
+
+pub const POSTGRES_SERVER: &str = "POSTGRES_SERVER";
 
 #[async_trait]
 impl Server for PostgresServer {
@@ -112,9 +126,13 @@ impl Server for PostgresServer {
             .map(|server_conf| Arc::new(TlsAcceptor::from(Arc::new(server_conf))));
 
         let io_runtime = self.base_server.io_runtime();
-        let join_handle = tokio::spawn(self.accept(io_runtime, stream, tls_acceptor));
+        let join_handle = common_runtime::spawn_read(self.accept(io_runtime, stream, tls_acceptor));
 
         self.base_server.start_with(join_handle).await?;
         Ok(addr)
+    }
+
+    fn name(&self) -> &str {
+        POSTGRES_SERVER
     }
 }

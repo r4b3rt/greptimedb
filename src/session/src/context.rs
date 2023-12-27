@@ -16,22 +16,27 @@ use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use api::v1::region::RegionRequestHeader;
 use arc_swap::ArcSwap;
+use auth::UserInfoRef;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_telemetry::debug;
+use common_catalog::{build_db_string, parse_catalog_and_schema_from_db_string};
+use common_time::TimeZone;
+use derive_builder::Builder;
+use sql::dialect::{Dialect, GreptimeDbDialect, MySqlDialect, PostgreSqlDialect};
 
 pub type QueryContextRef = Arc<QueryContext>;
 pub type ConnInfoRef = Arc<ConnInfo>;
 
+#[derive(Debug, Builder)]
+#[builder(pattern = "owned")]
+#[builder(build_fn(skip))]
 pub struct QueryContext {
-    current_catalog: ArcSwap<String>,
-    current_schema: ArcSwap<String>,
-}
-
-impl Default for QueryContext {
-    fn default() -> Self {
-        Self::new()
-    }
+    current_catalog: String,
+    current_schema: String,
+    current_user: ArcSwap<Option<UserInfoRef>>,
+    time_zone: Option<TimeZone>,
+    sql_dialect: Box<dyn Dialect + Send + Sync>,
 }
 
 impl Display for QueryContext {
@@ -45,86 +50,130 @@ impl Display for QueryContext {
     }
 }
 
+impl From<&RegionRequestHeader> for QueryContext {
+    fn from(value: &RegionRequestHeader) -> Self {
+        let (catalog, schema) = parse_catalog_and_schema_from_db_string(&value.dbname);
+        QueryContext {
+            current_catalog: catalog.to_string(),
+            current_schema: schema.to_string(),
+            current_user: Default::default(),
+            time_zone: Default::default(),
+            sql_dialect: Box::new(GreptimeDbDialect {}),
+        }
+    }
+}
+
 impl QueryContext {
     pub fn arc() -> QueryContextRef {
-        Arc::new(QueryContext::new())
+        QueryContextBuilder::default().build()
     }
 
-    pub fn new() -> Self {
-        Self {
-            current_catalog: ArcSwap::new(Arc::new(DEFAULT_CATALOG_NAME.to_string())),
-            current_schema: ArcSwap::new(Arc::new(DEFAULT_SCHEMA_NAME.to_string())),
-        }
+    pub fn with(catalog: &str, schema: &str) -> QueryContextRef {
+        QueryContextBuilder::default()
+            .current_catalog(catalog.to_string())
+            .current_schema(schema.to_string())
+            .build()
     }
 
-    pub fn with(catalog: &str, schema: &str) -> Self {
-        Self {
-            current_catalog: ArcSwap::new(Arc::new(catalog.to_string())),
-            current_schema: ArcSwap::new(Arc::new(schema.to_string())),
-        }
+    pub fn with_db_name(db_name: Option<&String>) -> QueryContextRef {
+        let (catalog, schema) = db_name
+            .map(|db| {
+                let (catalog, schema) = parse_catalog_and_schema_from_db_string(db);
+                (catalog.to_string(), schema.to_string())
+            })
+            .unwrap_or_else(|| {
+                (
+                    DEFAULT_CATALOG_NAME.to_string(),
+                    DEFAULT_SCHEMA_NAME.to_string(),
+                )
+            });
+        QueryContextBuilder::default()
+            .current_catalog(catalog)
+            .current_schema(schema)
+            .build()
     }
 
-    pub fn current_schema(&self) -> String {
-        self.current_schema.load().as_ref().clone()
+    #[inline]
+    pub fn current_schema(&self) -> &str {
+        &self.current_schema
     }
 
-    pub fn current_catalog(&self) -> String {
-        self.current_catalog.load().as_ref().clone()
+    #[inline]
+    pub fn current_catalog(&self) -> &str {
+        &self.current_catalog
     }
 
-    pub fn set_current_schema(&self, schema: &str) {
-        let last = self.current_schema.swap(Arc::new(schema.to_string()));
-        debug!(
-            "set new session default schema: {:?}, swap old: {:?}",
-            schema, last
-        )
+    #[inline]
+    pub fn sql_dialect(&self) -> &(dyn Dialect + Send + Sync) {
+        &*self.sql_dialect
     }
 
-    pub fn set_current_catalog(&self, catalog: &str) {
-        let last = self.current_catalog.swap(Arc::new(catalog.to_string()));
-        debug!(
-            "set new session default catalog: {:?}, swap old: {:?}",
-            catalog, last
-        )
-    }
-}
-
-pub const DEFAULT_USERNAME: &str = "greptime";
-
-#[derive(Clone, Debug)]
-pub struct UserInfo {
-    username: String,
-}
-
-impl Default for UserInfo {
-    fn default() -> Self {
-        Self {
-            username: DEFAULT_USERNAME.to_string(),
-        }
-    }
-}
-
-impl UserInfo {
-    pub fn username(&self) -> &str {
-        self.username.as_str()
+    pub fn get_db_string(&self) -> String {
+        let catalog = self.current_catalog();
+        let schema = self.current_schema();
+        build_db_string(catalog, schema)
     }
 
-    pub fn new(username: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-        }
+    #[inline]
+    pub fn time_zone(&self) -> Option<TimeZone> {
+        self.time_zone.clone()
+    }
+
+    #[inline]
+    pub fn current_user(&self) -> Option<UserInfoRef> {
+        self.current_user.load().as_ref().clone()
+    }
+
+    #[inline]
+    pub fn set_current_user(&self, user: Option<UserInfoRef>) {
+        let _ = self.current_user.swap(Arc::new(user));
     }
 }
 
+impl QueryContextBuilder {
+    pub fn build(self) -> QueryContextRef {
+        Arc::new(QueryContext {
+            current_catalog: self
+                .current_catalog
+                .unwrap_or_else(|| DEFAULT_CATALOG_NAME.to_string()),
+            current_schema: self
+                .current_schema
+                .unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_string()),
+            current_user: self
+                .current_user
+                .unwrap_or_else(|| ArcSwap::new(Arc::new(None))),
+            time_zone: self.time_zone.unwrap_or(None),
+            sql_dialect: self
+                .sql_dialect
+                .unwrap_or_else(|| Box::new(GreptimeDbDialect {})),
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct ConnInfo {
-    pub client_host: SocketAddr,
+    pub client_addr: Option<SocketAddr>,
     pub channel: Channel,
 }
 
+impl Display for ConnInfo {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}[{}]",
+            self.channel,
+            self.client_addr
+                .map(|addr| addr.to_string())
+                .as_deref()
+                .unwrap_or("unknown client addr")
+        )
+    }
+}
+
 impl ConnInfo {
-    pub fn new(client_host: SocketAddr, channel: Channel) -> Self {
+    pub fn new(client_addr: Option<SocketAddr>, channel: Channel) -> Self {
         Self {
-            client_host,
+            client_addr,
             channel,
         }
     }
@@ -132,34 +181,57 @@ impl ConnInfo {
 
 #[derive(Debug, PartialEq)]
 pub enum Channel {
-    Grpc,
-    Http,
     Mysql,
     Postgres,
-    Opentsdb,
-    Influxdb,
-    Prometheus,
+}
+
+impl Channel {
+    pub fn dialect(&self) -> Box<dyn Dialect + Send + Sync> {
+        match self {
+            Channel::Mysql => Box::new(MySqlDialect {}),
+            Channel::Postgres => Box::new(PostgreSqlDialect {}),
+        }
+    }
+}
+
+impl Display for Channel {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            Channel::Mysql => write!(f, "mysql"),
+            Channel::Postgres => write!(f, "postgres"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::context::{Channel, UserInfo};
+    use common_catalog::consts::DEFAULT_CATALOG_NAME;
+
+    use super::*;
+    use crate::context::Channel;
     use crate::Session;
 
     #[test]
     fn test_session() {
-        let session = Session::new("127.0.0.1:9000".parse().unwrap(), Channel::Mysql);
+        let session = Session::new(Some("127.0.0.1:9000".parse().unwrap()), Channel::Mysql);
         // test user_info
         assert_eq!(session.user_info().username(), "greptime");
-        session.set_user_info(UserInfo::new("root"));
-        assert_eq!(session.user_info().username(), "root");
 
         // test channel
         assert_eq!(session.conn_info().channel, Channel::Mysql);
-        assert_eq!(
-            session.conn_info().client_host.ip().to_string(),
-            "127.0.0.1"
-        );
-        assert_eq!(session.conn_info().client_host.port(), 9000);
+        let client_addr = session.conn_info().client_addr.as_ref().unwrap();
+        assert_eq!(client_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(client_addr.port(), 9000);
+
+        assert_eq!("mysql[127.0.0.1:9000]", session.conn_info().to_string());
+    }
+
+    #[test]
+    fn test_context_db_string() {
+        let context = QueryContext::with("a0b1c2d3", "test");
+        assert_eq!("a0b1c2d3-test", context.get_db_string());
+
+        let context = QueryContext::with(DEFAULT_CATALOG_NAME, "test");
+        assert_eq!("test", context.get_db_string());
     }
 }

@@ -17,10 +17,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
+use datafusion::error::Result as DfResult;
+use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStream};
+use datafusion::physical_plan::metrics::BaselineMetrics;
 use datafusion::physical_plan::RecordBatchStream as DfRecordBatchStream;
 use datafusion_common::DataFusionError;
-use datatypes::arrow::error::{ArrowError, Result as ArrowResult};
 use datatypes::schema::{Schema, SchemaRef};
 use futures::ready;
 use snafu::ResultExt;
@@ -31,15 +34,84 @@ use crate::{
     SendableRecordBatchStream, Stream,
 };
 
-type FutureStream = Pin<
-    Box<
-        dyn std::future::Future<
-                Output = std::result::Result<DfSendableRecordBatchStream, DataFusionError>,
-            > + Send,
-    >,
->;
+type FutureStream =
+    Pin<Box<dyn std::future::Future<Output = Result<SendableRecordBatchStream>> + Send>>;
 
-/// Greptime SendableRecordBatchStream -> DataFusion RecordBatchStream
+/// ParquetRecordBatchStream -> DataFusion RecordBatchStream
+pub struct ParquetRecordBatchStreamAdapter<T> {
+    stream: ParquetRecordBatchStream<T>,
+    output_schema: DfSchemaRef,
+    projection: Vec<usize>,
+}
+
+impl<T: Unpin + AsyncFileReader + Send + 'static> ParquetRecordBatchStreamAdapter<T> {
+    pub fn new(
+        output_schema: DfSchemaRef,
+        stream: ParquetRecordBatchStream<T>,
+        projection: Option<Vec<usize>>,
+    ) -> Self {
+        let projection = if let Some(projection) = projection {
+            projection
+        } else {
+            (0..output_schema.fields().len()).collect()
+        };
+
+        Self {
+            stream,
+            output_schema,
+            projection,
+        }
+    }
+}
+
+impl<T: Unpin + AsyncFileReader + Send + 'static> DfRecordBatchStream
+    for ParquetRecordBatchStreamAdapter<T>
+{
+    fn schema(&self) -> DfSchemaRef {
+        self.stream.schema().clone()
+    }
+}
+
+impl<T: Unpin + AsyncFileReader + Send + 'static> Stream for ParquetRecordBatchStreamAdapter<T> {
+    type Item = DfResult<DfRecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let batch = futures::ready!(Pin::new(&mut self.stream).poll_next(cx))
+            .map(|r| r.map_err(|e| DataFusionError::External(Box::new(e))));
+
+        let projected_schema = self.output_schema.project(&self.projection)?;
+        let batch = batch.map(|b| {
+            b.and_then(|b| {
+                let mut columns = Vec::with_capacity(self.projection.len());
+                for idx in self.projection.iter() {
+                    let column = b.column(*idx);
+                    let field = self.output_schema.field(*idx);
+
+                    if column.data_type() != field.data_type() {
+                        let output = cast(&column, field.data_type())?;
+                        columns.push(output)
+                    } else {
+                        columns.push(column.clone())
+                    }
+                }
+
+                let record_batch = DfRecordBatch::try_new(projected_schema.into(), columns)?;
+
+                Ok(record_batch)
+            })
+        });
+
+        Poll::Ready(batch)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
+
+/// Greptime SendableRecordBatchStream -> DataFusion RecordBatchStream.
+/// The reverse one is [RecordBatchStreamAdapter].
 pub struct DfRecordBatchStreamAdapter {
     stream: SendableRecordBatchStream,
 }
@@ -57,14 +129,14 @@ impl DfRecordBatchStream for DfRecordBatchStreamAdapter {
 }
 
 impl Stream for DfRecordBatchStreamAdapter {
-    type Item = ArrowResult<DfRecordBatch>;
+    type Item = DfResult<DfRecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.stream).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(recordbatch)) => match recordbatch {
                 Ok(recordbatch) => Poll::Ready(Some(Ok(recordbatch.into_df_record_batch()))),
-                Err(e) => Poll::Ready(Some(Err(ArrowError::ExternalError(Box::new(e))))),
+                Err(e) => Poll::Ready(Some(Err(DataFusionError::External(Box::new(e))))),
             },
             Poll::Ready(None) => Poll::Ready(None),
         }
@@ -76,17 +148,36 @@ impl Stream for DfRecordBatchStreamAdapter {
     }
 }
 
-/// DataFusion SendableRecordBatchStream -> Greptime RecordBatchStream
+/// DataFusion [SendableRecordBatchStream](DfSendableRecordBatchStream) -> Greptime [RecordBatchStream].
+/// The reverse one is [DfRecordBatchStreamAdapter]
 pub struct RecordBatchStreamAdapter {
     schema: SchemaRef,
     stream: DfSendableRecordBatchStream,
+    metrics: Option<BaselineMetrics>,
 }
 
 impl RecordBatchStreamAdapter {
     pub fn try_new(stream: DfSendableRecordBatchStream) -> Result<Self> {
         let schema =
             Arc::new(Schema::try_from(stream.schema()).context(error::SchemaConversionSnafu)?);
-        Ok(Self { schema, stream })
+        Ok(Self {
+            schema,
+            stream,
+            metrics: None,
+        })
+    }
+
+    pub fn try_new_with_metrics(
+        stream: DfSendableRecordBatchStream,
+        metrics: BaselineMetrics,
+    ) -> Result<Self> {
+        let schema =
+            Arc::new(Schema::try_from(stream.schema()).context(error::SchemaConversionSnafu)?);
+        Ok(Self {
+            schema,
+            stream,
+            metrics: Some(metrics),
+        })
     }
 }
 
@@ -100,6 +191,12 @@ impl Stream for RecordBatchStreamAdapter {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let timer = self
+            .metrics
+            .as_ref()
+            .map(|m| m.elapsed_compute().clone())
+            .unwrap_or_default();
+        let _guard = timer.timer();
         match Pin::new(&mut self.stream).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(df_record_batch)) => {
@@ -121,7 +218,7 @@ impl Stream for RecordBatchStreamAdapter {
 
 enum AsyncRecordBatchStreamAdapterState {
     Uninit(FutureStream),
-    Ready(DfSendableRecordBatchStream),
+    Ready(SendableRecordBatchStream),
     Failed,
 }
 
@@ -159,17 +256,12 @@ impl Stream for AsyncRecordBatchStreamAdapter {
                         }
                         Err(e) => {
                             self.state = AsyncRecordBatchStreamAdapterState::Failed;
-                            return Poll::Ready(Some(
-                                Err(e).context(error::InitRecordbatchStreamSnafu),
-                            ));
+                            return Poll::Ready(Some(Err(e)));
                         }
                     };
                 }
                 AsyncRecordBatchStreamAdapterState::Ready(stream) => {
-                    return Poll::Ready(ready!(Pin::new(stream).poll_next(cx)).map(|x| {
-                        let df_record_batch = x.context(error::PollStreamSnafu)?;
-                        RecordBatch::try_from_df_record_batch(self.schema(), df_record_batch)
-                    }))
+                    return Poll::Ready(ready!(Pin::new(stream).poll_next(cx)))
                 }
                 AsyncRecordBatchStreamAdapterState::Failed => return Poll::Ready(None),
             }
@@ -185,13 +277,16 @@ impl Stream for AsyncRecordBatchStreamAdapter {
 
 #[cfg(test)]
 mod test {
+    use common_error::ext::BoxedError;
     use common_error::mock::MockError;
-    use common_error::prelude::{BoxedError, StatusCode};
+    use common_error::status_code::StatusCode;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnSchema;
     use datatypes::vectors::Int32Vector;
+    use snafu::IntoError;
 
     use super::*;
+    use crate::error::Error;
     use crate::RecordBatches;
 
     #[tokio::test]
@@ -226,12 +321,7 @@ mod test {
         ) -> FutureStream {
             Box::pin(async move {
                 maybe_recordbatches
-                    .map(|items| {
-                        Box::pin(DfRecordBatchStreamAdapter::new(Box::pin(
-                            MaybeErrorRecordBatchStream { items },
-                        ))) as _
-                    })
-                    .map_err(|e| DataFusionError::External(Box::new(e)))
+                    .map(|items| Box::pin(MaybeErrorRecordBatchStream { items }) as _)
             })
         }
 
@@ -242,12 +332,12 @@ mod test {
         )]));
         let batch1 = RecordBatch::new(
             schema.clone(),
-            vec![Arc::new(Int32Vector::from_slice(&[1])) as _],
+            vec![Arc::new(Int32Vector::from_slice([1])) as _],
         )
         .unwrap();
         let batch2 = RecordBatch::new(
             schema.clone(),
-            vec![Arc::new(Int32Vector::from_slice(&[2])) as _],
+            vec![Arc::new(Int32Vector::from_slice([2])) as _],
         )
         .unwrap();
 
@@ -261,25 +351,28 @@ mod test {
 
         let poll_err_stream = new_future_stream(Ok(vec![
             Ok(batch1.clone()),
-            Err(error::Error::External {
-                source: BoxedError::new(MockError::new(StatusCode::Unknown)),
-            }),
+            Err(error::ExternalSnafu
+                .into_error(BoxedError::new(MockError::new(StatusCode::Unknown)))),
         ]));
         let adapter = AsyncRecordBatchStreamAdapter::new(schema.clone(), poll_err_stream);
-        let result = RecordBatches::try_collect(Box::pin(adapter)).await;
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Failed to poll stream, source: External error: External error, source: Unknown"
+        let err = RecordBatches::try_collect(Box::pin(adapter))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::External { .. }),
+            "unexpected err {err}"
         );
 
-        let failed_to_init_stream = new_future_stream(Err(error::Error::External {
-            source: BoxedError::new(MockError::new(StatusCode::Internal)),
-        }));
+        let failed_to_init_stream =
+            new_future_stream(Err(error::ExternalSnafu
+                .into_error(BoxedError::new(MockError::new(StatusCode::Internal)))));
         let adapter = AsyncRecordBatchStreamAdapter::new(schema.clone(), failed_to_init_stream);
-        let result = RecordBatches::try_collect(Box::pin(adapter)).await;
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Failed to init Recordbatch stream, source: External error: External error, source: Internal"
+        let err = RecordBatches::try_collect(Box::pin(adapter))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::External { .. }),
+            "unexpected err {err}"
         );
     }
 }
